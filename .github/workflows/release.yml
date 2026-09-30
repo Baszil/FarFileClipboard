@@ -22,7 +22,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force package | Out-Null
           Copy-Item dist/FarFileClipboard package/FarFileClipboard -Recurse
-          Copy-Item install.cmd,README.md,README.ru.md package/
+	  Copy-Item install.cmd,install.ps1,README.md,README.ru.md package/
           Compress-Archive -Path package/* -DestinationPath FarFileClipboard-1.0.0-x64.zip
       - name: Package source
         shell: pwsh
