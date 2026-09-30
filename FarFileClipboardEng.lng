@@ -1,0 +1,124 @@
+﻿.Language=English,English
+// MPluginName
+"FarFileClipboard"
+// MMenuCopy
+"Copy to Windows clipboard"
+// MMenuCut
+"Cut to Windows clipboard"
+// MMenuPaste
+"Paste into current directory"
+// MMenuPasteInto
+"Paste into directory under cursor"
+// MMenuUndo
+"Undo last FarFileClipboard operation"
+// MMenuRedo
+"Redo undone operation"
+// MConfigCopy
+"Copy"
+// MConfigCut
+"Cut"
+// MConfigPaste
+"Paste"
+// MConfigPasteInto
+"Paste into directory under cursor"
+// MConfigUndo
+"Undo"
+// MConfigRedo
+"Redo"
+// MConfigPrefix
+"Ctrl+Shift+"
+// MConfigDefaults
+"&Defaults"
+// MConfigOk
+"&OK"
+// MConfigCancel
+"&Cancel"
+// MConfigLetterError
+"Enter one Latin letter A-Z for each command."
+// MHotkeysMustDiffer
+"All six commands must use different letters."
+// MSaveSettingsFailed
+"Could not save FarFileClipboard settings."
+// MPanelOnlyCopyCut
+"Copy and Cut are supported only on a normal file-system panel."
+// MActiveDirFailed
+"Could not determine the active panel directory."
+// MPanelItemFailed
+"Could not read an item from the active panel."
+// MCursorParentCopyCut
+"The cursor is on '..'. Select a file or directory first."
+// MObjectNotFound
+"Object not found:"
+// MNoFilesToCopyCut
+"There are no files or directories to copy or cut."
+// MClipboardWriteFailed
+"Could not write files to the Windows clipboard."
+// MClipboardEmpty
+"The Windows clipboard contains no file-system or Shell objects that can be pasted."
+// MOperationFailedPrefix
+"Windows could not complete the operation. Error code:"
+// MPastePanelOnly
+"Paste is supported only on a normal file-system panel."
+// MActivePanelNotFs
+"The active panel does not point to a normal file-system directory."
+// MCurrentItemFailed
+"Could not read the item under the cursor."
+// MNeedDirectoryUnderCursor
+"For this command, the cursor must be on a directory."
+// MDirectoryUnavailable
+"The directory under the cursor is unavailable:"
+// MUndoUnavailable
+"There is no FarFileClipboard operation to undo."
+// MRedoUnavailable
+"There is no undone FarFileClipboard operation to redo."
+// MUndoStateChanged
+"Undo is no longer safe: files involved in the last operation have changed, disappeared, or their original names are occupied."
+// MRedoStateChanged
+"Redo is no longer safe: source files are missing or the destination names are occupied."
+// MUndoCancelled
+"Undo was cancelled. The one-level history was cleared because the file operation may have completed only partially."
+// MRedoCancelled
+"Redo was cancelled. The one-level history was cleared because the file operation may have completed only partially."
+// MUndoFailedPrefix
+"Windows could not undo the operation. The one-level history was cleared. Error code:"
+// MRedoFailedPrefix
+"Windows could not redo the operation. The one-level history was cleared. Error code:"
+
+// MConfigPrecheckInvalid
+"&Pre-check invalid operations"
+// MConfigConflictAsk
+"&Ask what to do"
+// MConfigConflictSystem
+"Use &Windows behavior"
+// MConfigConflictAutoRename
+"Automatically &rename"
+// MConfigAutoRenameTemplate
+"Name template:"
+// MConfigAutoRenameTemplateError
+"Invalid auto-rename template. Use {name}, {ext}, and mandatory {n}. Example: {name} ({n}){ext}"
+// MAutoRenameFailed
+"Could not find a free name using the auto-rename template."
+// MInvalidRecursiveOperation
+"This operation is impossible: a directory cannot be copied or moved into itself or one of its descendants."
+// MMoveSameLocation
+"The source and destination of the move are the same object."
+// MWarningTitle
+"Warning"
+// MConflictExists
+"An object with this name already exists:"
+// MConflictApplyAll
+"Apply to &all conflicts"
+// MConflictReplace
+"&Replace"
+// MConflictSkip
+"&Skip"
+// MConflictRename
+"Re&name"
+// MConflictCancel
+"&Cancel"
+// MConflictNewName
+"New name"
+// MConflictInvalidName
+"Enter a valid single file or directory name."
+// MConflictNameExists
+"An object with that name already exists. Choose another name."
