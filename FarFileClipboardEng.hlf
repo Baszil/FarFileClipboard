@@ -1,0 +1,77 @@
+﻿.Language=English,English
+.PluginContents=FarFileClipboard
+
+@Contents
+$ #FarFileClipboard 1.0#
+
+FarFileClipboard by Qwaduda connects a normal Far Manager file panel to the Windows file clipboard.
+
+Default hotkeys:
+
+ #Ctrl+Shift+C#  Copy selected files/directories to the Windows clipboard.
+ #Ctrl+Shift+X#  Cut selected files/directories to the Windows clipboard.
+ #Ctrl+Shift+V#  Paste into the directory currently open on the active panel.
+ #Ctrl+Shift+D#  Paste into the real directory under the cursor without entering it.
+ #Ctrl+Shift+Z#  Undo the last reversible file operation performed by FarFileClipboard.
+ #Ctrl+Shift+E#  Redo the operation undone by FarFileClipboard.
+
+When one or more items are selected with #Insert#, Copy and Cut use the selection. Otherwise they use the item under the cursor.
+
+Ordinary Paste always uses the directory currently open on the active panel. The item under the cursor never changes its destination.
+
+~Configuration~@Config@
+~File-operation behavior~@Behavior@
+~Commands and clipboard behavior~@Commands@
+~Undo and Redo~@UndoRedo@
+
+@Config
+$ #FarFileClipboard configuration#
+
+All six hotkeys are configured on one screen in #Options -> Plugins configuration -> FarFileClipboard#.
+
+The #Ctrl+Shift+# prefix is fixed. Each command accepts exactly one Latin letter A-Z; lowercase input is normalized to uppercase.
+
+Defaults are #C#, #X#, #V#, #D#, #Z# and #E#, i.e. Ctrl+Shift+C / X / V / D / Z / E.
+
+The #Defaults# button restores the original letters and default behavior settings. All six commands must use different letters.
+
+The same screen also configures invalid-operation prechecks and name-conflict handling.
+
+@Behavior
+$ #File-operation behavior#
+
+The #Pre-check invalid operations# checkbox enables FarFileClipboard checks for obviously invalid operations. When it is cleared, the request is passed straight to Windows; Windows restrictions still apply.
+
+Three name-conflict modes are available:
+
+ #Ask what to do# — a Replace / Skip / Rename / Cancel dialog. Replace and Skip can be applied to all remaining conflicts. Rename asks for an explicit new name for the incoming object.
+ #Use Windows behavior# — the conflict is delegated to Windows Shell.
+ #Automatically rename# — FarFileClipboard chooses a free name using the template shown directly below the conflict modes.
+
+Template placeholders: #{name}# — basename without the final extension (full name for directories), #{ext}# — final extension including the dot (empty for directories), #{n}# — collision counter. #{n}# is mandatory. Default: #{name} ({n}){ext}#.
+
+The defaults are FarFileClipboard preliminary checks and the FarFileClipboard conflict dialog.
+
+@Commands
+$ #Commands and clipboard behavior#
+
+#Copy# and #Cut# work only on a normal file-system panel. If items are selected with Insert, all selected items are placed on the clipboard; otherwise the item under the cursor is used.
+
+#Paste# always targets the directory currently open on the active panel. It never automatically enters a directory under the cursor.
+
+#Paste into directory under cursor# is a separate command. It works only when the cursor is on a real directory; files, "." and ".." are rejected.
+
+When copying/cutting from Far, the plugin uses CF_HDROP and the preferred drop effect, so the clipboard interoperates with Explorer and other compatible applications. Paste into Far also supports virtual Shell objects without ordinary paths, for example files copied directly from a ZIP opened in Explorer.
+
+@UndoRedo
+$ #Undo and Redo#
+
+FarFileClipboard keeps one last file-system operation that it performed itself during Paste.
+
+#Ctrl+Shift+Z# undoes that operation. For Copy, the created objects are removed through Windows Shell with system undo preservation requested; for Move, objects are returned to their original paths.
+
+#Ctrl+Shift+E# redoes only the operation that was just undone.
+
+History is created only when none of the target names existed before Paste. Directory merges and replacements can still proceed, but they are not considered safely reversible and are not recorded.
+
+Before Undo/Redo, the plugin checks file identity and name conflicts. Operations later performed by Explorer after Copy/Cut from Far are outside this history. Undo/Redo history is not created for a paste from a virtual Shell source such as an Explorer ZIP folder because those objects may not have stable original file-system paths.

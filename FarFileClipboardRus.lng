@@ -1,0 +1,124 @@
+﻿.Language=Russian,Русский
+// MPluginName
+"FarFileClipboard"
+// MMenuCopy
+"Копировать в буфер Windows"
+// MMenuCut
+"Вырезать в буфер Windows"
+// MMenuPaste
+"Вставить в текущий каталог"
+// MMenuPasteInto
+"Вставить в каталог под курсором"
+// MMenuUndo
+"Отменить последнюю операцию FarFileClipboard"
+// MMenuRedo
+"Повторить отменённую операцию"
+// MConfigCopy
+"Копирование"
+// MConfigCut
+"Вырезание"
+// MConfigPaste
+"Вставка"
+// MConfigPasteInto
+"Вставка в папку под курсором"
+// MConfigUndo
+"Отменить"
+// MConfigRedo
+"Повторить"
+// MConfigPrefix
+"Ctrl+Shift+"
+// MConfigDefaults
+"&По умолчанию"
+// MConfigOk
+"&OK"
+// MConfigCancel
+"О&тмена"
+// MConfigLetterError
+"Для каждой команды укажите одну латинскую букву A-Z."
+// MHotkeysMustDiffer
+"Для шести команд нужны шесть разных букв."
+// MSaveSettingsFailed
+"Не удалось сохранить настройки FarFileClipboard."
+// MPanelOnlyCopyCut
+"Копирование и вырезание поддерживаются только на обычной файловой панели."
+// MActiveDirFailed
+"Не удалось определить каталог активной панели."
+// MPanelItemFailed
+"Не удалось получить элемент активной панели."
+// MCursorParentCopyCut
+"Курсор стоит на '..'. Выберите файл или каталог."
+// MObjectNotFound
+"Не найден объект:"
+// MNoFilesToCopyCut
+"Нет файлов или каталогов для копирования или вырезания."
+// MClipboardWriteFailed
+"Не удалось записать файлы в системный буфер Windows."
+// MClipboardEmpty
+"В буфере Windows нет файловых объектов, которые можно вставить."
+// MOperationFailedPrefix
+"Windows не смогла выполнить операцию. Код ошибки:"
+// MPastePanelOnly
+"Вставка поддерживается только в обычную файловую панель."
+// MActivePanelNotFs
+"Активная панель не указывает на обычную папку файловой системы."
+// MCurrentItemFailed
+"Не удалось получить объект под курсором."
+// MNeedDirectoryUnderCursor
+"Для этой команды курсор должен стоять на каталоге."
+// MDirectoryUnavailable
+"Каталог под курсором недоступен:"
+// MUndoUnavailable
+"Нет операции FarFileClipboard, которую можно отменить."
+// MRedoUnavailable
+"Нет отменённой операции FarFileClipboard, которую можно повторить."
+// MUndoStateChanged
+"Безопасно отменить операцию уже нельзя: участвовавшие файлы изменились, исчезли или их исходные имена заняты."
+// MRedoStateChanged
+"Безопасно повторить операцию уже нельзя: исходные файлы исчезли или имена в месте назначения заняты."
+// MUndoCancelled
+"Отмена прервана. Одноуровневая история очищена, потому что файловая операция могла выполниться частично."
+// MRedoCancelled
+"Повтор прерван. Одноуровневая история очищена, потому что файловая операция могла выполниться частично."
+// MUndoFailedPrefix
+"Windows не смогла отменить операцию. Одноуровневая история очищена. Код ошибки:"
+// MRedoFailedPrefix
+"Windows не смогла повторить операцию. Одноуровневая история очищена. Код ошибки:"
+
+// MConfigPrecheckInvalid
+"&Предварительно проверять недопустимые операции"
+// MConfigConflictAsk
+"&Спрашивать, что делать"
+// MConfigConflictSystem
+"Использовать поведение &Windows"
+// MConfigConflictAutoRename
+"&Автоматически переименовывать"
+// MConfigAutoRenameTemplate
+"Шаблон имени:"
+// MConfigAutoRenameTemplateError
+"Некорректный шаблон автопереименования. Используйте {name}, {ext} и обязательно {n}. Например: {name} ({n}){ext}"
+// MAutoRenameFailed
+"Не удалось подобрать свободное имя по шаблону автопереименования."
+// MInvalidRecursiveOperation
+"Такая операция невозможна: каталог нельзя скопировать или переместить внутрь него самого или его потомка."
+// MMoveSameLocation
+"Источник и место назначения перемещения — один и тот же объект."
+// MWarningTitle
+"Предупреждение"
+// MConflictExists
+"Объект с таким именем уже существует:"
+// MConflictApplyAll
+"Применить ко &всем конфликтам"
+// MConflictReplace
+"&Заменить"
+// MConflictSkip
+"&Пропустить"
+// MConflictRename
+"Пе&реименовать"
+// MConflictCancel
+"О&тмена"
+// MConflictNewName
+"Новое имя"
+// MConflictInvalidName
+"Укажите корректное имя одного файла или каталога."
+// MConflictNameExists
+"Объект с таким именем уже существует. Выберите другое имя."

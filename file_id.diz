@@ -1,0 +1,13 @@
+FarFileClipboard 1.0.0
+Far Manager 3 x64 plugin by Qwaduda
+2026-09-30
+
+EN: Windows file clipboard integration for Far Manager.
+Copy, Cut, Paste, Paste into directory under cursor, Explorer ZIP/Shell paste,
+one-level Undo/Redo, and configurable conflict handling.
+
+RU: Интеграция файлового буфера Windows с Far Manager.
+Копирование, вырезание, вставка, вставка в каталог под курсором,
+вставка из ZIP/Shell Проводника, одноуровневая отмена/повтор и конфликты.
+
+License: BSD-3-Clause
