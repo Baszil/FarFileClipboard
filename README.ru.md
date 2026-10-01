@@ -1,6 +1,6 @@
-# FarFileClipboard
+﻿# FarFileClipboard
 
-**FarFileClipboard** — плагин для Far Manager 3 x64 от **Qwaduda**, связывающий обычную файловую панель Far с системным файловым буфером Windows.
+**FarFileClipboard** — плагин для Far Manager 3 под x86, x64 и ARM64 от **Qwaduda**, связывающий обычную файловую панель Far с системным файловым буфером Windows.
 
 [English](README.md)
 
@@ -53,7 +53,7 @@ Far автоматически выбирает нужный язык. Из на
 
 ## Требования
 
-- Far Manager 3 x64
+- Far Manager 3 той же архитектуры, что и DLL плагина: x86, x64 или ARM64
 - Windows
 - Для сборки исходников: Visual Studio 2022 с C++ и CMake
 
@@ -62,19 +62,31 @@ Far автоматически выбирает нужный язык. Из на
 Запустить:
 
 ```cmd
-build.cmd
+build.cmd x86
+build.cmd x64
+build.cmd ARM64
 ```
 
-Готовая папка плагина появится здесь:
+Готовые папки плагина появятся в `dist\FarFileClipboard-x86`, `dist\FarFileClipboard-x64` и `dist\FarFileClipboard-ARM64`.
 
-```text
-dist\FarFileClipboard\
-```
-
-Чтобы сразу получить ZIP для распространения:
+Собрать все три варианта подряд:
 
 ```cmd
-package.cmd
+build-all.cmd
+```
+
+Создать отдельный ZIP для одной архитектуры:
+
+```cmd
+package.cmd x86
+package.cmd x64
+package.cmd ARM64
+```
+
+Создать все три release ZIP:
+
+```cmd
+package-all.cmd
 ```
 
 ## Установка

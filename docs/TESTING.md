@@ -1,6 +1,6 @@
-# FarFileClipboard 1.0 — release test checklist
+﻿# FarFileClipboard 1.0 — release test checklist
 
-Run the checklist on Far Manager 3 x64 before tagging `v1.0.0`.
+Run the full checklist on Far Manager 3 x64. Repeat the smoke-test subset on x86 and ARM64 before a multi-architecture release.
 
 ## Clipboard interoperability
 
@@ -97,3 +97,23 @@ With **Pre-check invalid operations** disabled:
 - Choosing Cancel in the conflict dialog returns directly to the panel without a second "operation cancelled" popup.
 - Configuration dialog contains no empty spacer rows between groups; separators are plain Far separators rather than titled decorative bars.
 - The auto-rename template field is disabled unless the Auto rename conflict mode is selected.
+
+## Multi-architecture smoke test
+
+Run this subset on each architecture with a matching Far Manager build:
+
+- x86 Far + x86 plugin: plugin loads, F11 menu opens, configuration opens, Copy/Paste works in both directions with Explorer.
+- x64 Far + x64 plugin: same smoke test, then run the full checklist above.
+- ARM64 Far + ARM64 plugin: plugin loads natively, F11 menu opens, configuration opens, Copy/Paste works in both directions with Explorer.
+- Verify that a DLL built for the wrong architecture is not used as a substitute for the matching build.
+- For every DLL, check PE machine type with `dumpbin /headers FarFileClipboard.dll` before packaging.
+
+## PE architecture verification
+
+Every local `build.cmd <arch>` run and every GitHub Actions build validates the PE machine field of `FarFileClipboard.dll` with `tools\verify-pe.ps1`:
+
+- x86 = `IMAGE_FILE_MACHINE_I386` (`0x014C`)
+- x64 = `IMAGE_FILE_MACHINE_AMD64` (`0x8664`)
+- ARM64 = `IMAGE_FILE_MACHINE_ARM64` (`0xAA64`)
+
+This check does not execute an ARM64 DLL on an x64 machine; it proves that the produced binary targets the requested architecture. The ARM64 smoke test still has to be run in ARM64 Far on Windows ARM64.

@@ -6,9 +6,19 @@ if(NOT WIN32)
     message(FATAL_ERROR "FarFileClipboard is a Windows-only Far Manager plugin")
 endif()
 
-if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
-    message(FATAL_ERROR "FarFileClipboard 1.0 supports Far Manager x64 only")
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    set(FFC_ARCH "x86")
+elseif(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    if(CMAKE_GENERATOR_PLATFORM STREQUAL "ARM64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$")
+        set(FFC_ARCH "ARM64")
+    else()
+        set(FFC_ARCH "x64")
+    endif()
+else()
+    message(FATAL_ERROR "Unsupported pointer size: ${CMAKE_SIZEOF_VOID_P}")
 endif()
+
+message(STATUS "FarFileClipboard target architecture: ${FFC_ARCH}")
 
 add_library(FarFileClipboard SHARED
     src/plugin.cpp
@@ -24,6 +34,7 @@ target_compile_definitions(FarFileClipboard PRIVATE
     WIN32_LEAN_AND_MEAN
     NOMINMAX
     _WIN32_WINNT=0x0601
+    FFC_ARCH_NAME=L"${FFC_ARCH}"
 )
 
 if(MSVC)
@@ -37,7 +48,7 @@ set_target_properties(FarFileClipboard PROPERTIES
     OUTPUT_NAME "FarFileClipboard"
 )
 
-set(DIST_DIR "${CMAKE_SOURCE_DIR}/dist/FarFileClipboard")
+set(DIST_DIR "${CMAKE_SOURCE_DIR}/dist/FarFileClipboard-${FFC_ARCH}")
 set(RUNTIME_FILES
     "${CMAKE_SOURCE_DIR}/FarFileClipboardEng.lng"
     "${CMAKE_SOURCE_DIR}/FarFileClipboardRus.lng"
@@ -51,5 +62,5 @@ add_custom_command(TARGET FarFileClipboard POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${DIST_DIR}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:FarFileClipboard>" "${DIST_DIR}/FarFileClipboard.dll"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${RUNTIME_FILES} "${DIST_DIR}"
-    COMMENT "Preparing dist/FarFileClipboard"
+    COMMENT "Preparing dist/FarFileClipboard-${FFC_ARCH}"
 )

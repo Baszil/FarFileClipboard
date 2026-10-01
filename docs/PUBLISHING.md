@@ -1,9 +1,9 @@
-# Publishing FarFileClipboard
+﻿# Publishing FarFileClipboard
 
 ## 1. Local release test
 
 1. Close Far Manager instances that load an older FarPaste / CopyPaste / FarFileClipboard DLL.
-2. Run `build.cmd`.
+2. Run `build-all.cmd` and verify that x86, x64 and ARM64 all build.
 3. Run `install.cmd` and verify UAC elevation when Far is under Program Files. For an update with the DLL already loaded, verify the detached installer waits for Far to close and resumes automatically.
 4. Remove old `Far\Plugins\FarPaste` and `Far\Plugins\CopyPaste` directories.
 5. Start Far and test the matrix below.
@@ -60,7 +60,7 @@ Push the repository and create the tag:
 v1.0.0
 ```
 
-The included GitHub Actions workflows build x64 on Windows, upload a build artifact for every push/PR, and create binary/source ZIP assets for version tags.
+The included GitHub Actions workflows build x86, x64 and ARM64 on Windows for every push/PR. Version tags create three binary ZIP assets plus the source ZIP.
 
 ## 3. Far forum
 
@@ -74,3 +74,13 @@ Use the short descriptions in:
 - `docs/plugring-description-en.txt`
 
 Point the project/homepage link to GitHub and the download link to the latest GitHub release.
+
+## Architecture notes
+
+The release contains three independent packages:
+
+- `FarFileClipboard-1.0.0-x86.zip`
+- `FarFileClipboard-1.0.0-x64.zip`
+- `FarFileClipboard-1.0.0-ARM64.zip`
+
+The architecture of `FarFileClipboard.dll` must match the architecture of Far Manager. ARM64 is a native ARM64 build, not ARM64EC.

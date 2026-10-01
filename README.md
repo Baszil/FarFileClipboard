@@ -1,6 +1,6 @@
-# FarFileClipboard
+﻿# FarFileClipboard
 
-**FarFileClipboard** is a Far Manager 3 x64 plugin by **Qwaduda** that connects a normal Far file panel to the Windows file clipboard.
+**FarFileClipboard** is a Far Manager 3 plugin for x86, x64 and ARM64 by **Qwaduda** that connects a normal Far file panel to the Windows file clipboard.
 
 [Русская версия](README.ru.md)
 
@@ -53,7 +53,7 @@ Far chooses the matching language automatically. Press `F1` from plugin configur
 
 ## Requirements
 
-- Far Manager 3 x64
+- Far Manager 3 matching the plugin DLL architecture: x86, x64 or ARM64
 - Windows
 - Visual Studio 2022 C++ toolchain and CMake to build from source
 
@@ -62,19 +62,31 @@ Far chooses the matching language automatically. Press `F1` from plugin configur
 Run:
 
 ```cmd
-build.cmd
+build.cmd x86
+build.cmd x64
+build.cmd ARM64
 ```
 
-The runtime plugin directory will be created at:
+Runtime directories are created under `dist\FarFileClipboard-x86`, `dist\FarFileClipboard-x64` and `dist\FarFileClipboard-ARM64`.
 
-```text
-dist\FarFileClipboard\
-```
-
-To also create a distributable ZIP:
+Build all three architectures:
 
 ```cmd
-package.cmd
+build-all.cmd
+```
+
+Create a distributable ZIP for one architecture:
+
+```cmd
+package.cmd x86
+package.cmd x64
+package.cmd ARM64
+```
+
+Create all three release ZIPs:
+
+```cmd
+package-all.cmd
 ```
 
 ## Install
