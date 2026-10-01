@@ -459,14 +459,28 @@ struct PluginStartupInfo
     FARAPISETTINGSCONTROL SettingsControl;
 };
 
-static_assert(sizeof(void*) == 8, "FarFileClipboard build is x64-only for now");
-static_assert(sizeof(GlobalInfo) == 96, "Unexpected GlobalInfo ABI layout");
-static_assert(sizeof(PluginInfo) == 104, "Unexpected PluginInfo ABI layout");
-static_assert(sizeof(FarPanelDirectory) == 48, "Unexpected FarPanelDirectory ABI layout");
-static_assert(sizeof(PluginPanelItem) == 160, "Unexpected PluginPanelItem ABI layout");
-static_assert(sizeof(FarGetPluginPanelItem) == 24, "Unexpected FarGetPluginPanelItem ABI layout");
-static_assert(sizeof(PanelInfo) == 104, "Unexpected PanelInfo ABI layout");
-static_assert(sizeof(FarSettingsCreate) == 32, "Unexpected FarSettingsCreate ABI layout");
-static_assert(sizeof(FarSettingsItem) == 48, "Unexpected FarSettingsItem ABI layout");
-static_assert(sizeof(FarDialogItem) == 112, "Unexpected FarDialogItem ABI layout");
-static_assert(sizeof(PluginStartupInfo) == 256, "Unexpected PluginStartupInfo ABI prefix layout");
+static_assert(sizeof(void*) == 4 || sizeof(void*) == 8, "Unsupported Windows ABI pointer size");
+
+#if INTPTR_MAX == INT32_MAX
+static_assert(sizeof(GlobalInfo) == 76, "Unexpected x86 GlobalInfo ABI layout");
+static_assert(sizeof(PluginInfo) == 64, "Unexpected x86 PluginInfo ABI layout");
+static_assert(sizeof(FarPanelDirectory) == 32, "Unexpected x86 FarPanelDirectory ABI layout");
+static_assert(sizeof(PluginPanelItem) == 112, "Unexpected x86 PluginPanelItem ABI layout");
+static_assert(sizeof(FarGetPluginPanelItem) == 12, "Unexpected x86 FarGetPluginPanelItem ABI layout");
+static_assert(sizeof(PanelInfo) == 80, "Unexpected x86 PanelInfo ABI layout");
+static_assert(sizeof(FarSettingsCreate) == 24, "Unexpected x86 FarSettingsCreate ABI layout");
+static_assert(sizeof(FarSettingsItem) == 32, "Unexpected x86 FarSettingsItem ABI layout");
+static_assert(sizeof(FarDialogItem) == 64, "Unexpected x86 FarDialogItem ABI layout");
+static_assert(sizeof(PluginStartupInfo) == 128, "Unexpected x86 PluginStartupInfo ABI prefix layout");
+#elif INTPTR_MAX == INT64_MAX
+static_assert(sizeof(GlobalInfo) == 96, "Unexpected 64-bit GlobalInfo ABI layout");
+static_assert(sizeof(PluginInfo) == 104, "Unexpected 64-bit PluginInfo ABI layout");
+static_assert(sizeof(FarPanelDirectory) == 48, "Unexpected 64-bit FarPanelDirectory ABI layout");
+static_assert(sizeof(PluginPanelItem) == 160, "Unexpected 64-bit PluginPanelItem ABI layout");
+static_assert(sizeof(FarGetPluginPanelItem) == 24, "Unexpected 64-bit FarGetPluginPanelItem ABI layout");
+static_assert(sizeof(PanelInfo) == 104, "Unexpected 64-bit PanelInfo ABI layout");
+static_assert(sizeof(FarSettingsCreate) == 32, "Unexpected 64-bit FarSettingsCreate ABI layout");
+static_assert(sizeof(FarSettingsItem) == 48, "Unexpected 64-bit FarSettingsItem ABI layout");
+static_assert(sizeof(FarDialogItem) == 112, "Unexpected 64-bit FarDialogItem ABI layout");
+static_assert(sizeof(PluginStartupInfo) == 256, "Unexpected 64-bit PluginStartupInfo ABI prefix layout");
+#endif

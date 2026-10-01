@@ -1,4 +1,12 @@
-# Changelog
+﻿# Changelog
+
+## Unreleased
+
+- Added first-class x86, x64 and ARM64 build targets.
+- Added architecture-specific local build/package scripts and CI artifacts.
+- GitHub release workflow now produces x86, x64, ARM64 and source ZIPs.
+- Added x86 Far API ABI layout checks while preserving the existing 64-bit checks.
+
 
 ## 1.0.0 — 2026-09-30
 
