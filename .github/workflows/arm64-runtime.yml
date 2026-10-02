@@ -50,7 +50,7 @@ jobs:
         shell: pwsh
         run: |
           Invoke-WebRequest `
-            "https://www.farmanager.com/files/Far30b6699_ARM64.20260614.7z" `
+            "https://www.farmanager.com/files/Far30b6699.ARM64.20260614.7z" `
             -OutFile "far.7z"
 
       - name: Extract Far ARM64
