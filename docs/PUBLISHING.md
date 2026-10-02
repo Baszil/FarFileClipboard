@@ -54,13 +54,18 @@
 
 Suggested repository name: `FarFileClipboard`.
 
-Push the repository and create the tag:
+Push the repository and create a version tag, for example:
 
 ```text
-v1.0.0
+v1.0.1
 ```
 
-The included GitHub Actions workflows build x86, x64 and ARM64 on Windows for every push/PR. Version tags create three binary ZIP assets plus the source ZIP.
+The release workflow accepts any `v*` tag and derives the package version from the tag name. The included GitHub Actions workflows build x86, x64 and ARM64 on Windows for every push/PR. Version tags create three binary ZIP assets plus the source ZIP.
+
+Before tagging a release, verify that the regular `build` workflow is green and that both ARM64 workflows are green:
+
+- `ARM64 runtime test` — launches ARM64 Far with the ARM64 plugin on native Windows ARM64.
+- `ARM64 functional test` — verifies plugin discovery and performs Copy/Paste between two Far panel directories through the plugin menu.
 
 ## 3. Far forum
 
@@ -77,10 +82,10 @@ Point the project/homepage link to GitHub and the download link to the latest Gi
 
 ## Architecture notes
 
-The release contains three independent packages:
+The release contains three independent packages whose version is derived from the Git tag:
 
-- `FarFileClipboard-1.0.0-x86.zip`
-- `FarFileClipboard-1.0.0-x64.zip`
-- `FarFileClipboard-1.0.0-ARM64.zip`
+- `FarFileClipboard-<version>-x86.zip`
+- `FarFileClipboard-<version>-x64.zip`
+- `FarFileClipboard-<version>-ARM64.zip`
 
 The architecture of `FarFileClipboard.dll` must match the architecture of Far Manager. ARM64 is a native ARM64 build, not ARM64EC.

@@ -1,0 +1,435 @@
+name: ARM64 functional test
+
+on:
+  push:
+    branches:
+      - arm64-functional-test
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure ARM64
+        run: cmake -S . -B build-ARM64 -G "Visual Studio 17 2022" -A ARM64
+
+      - name: Build ARM64
+        run: cmake --build build-ARM64 --config Release
+
+      - name: Upload ARM64 plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: FarFileClipboard-ARM64
+          path: dist/FarFileClipboard-ARM64/
+
+  functional:
+    needs: build
+    runs-on: windows-11-arm
+    timeout-minutes: 5
+
+    steps:
+      - name: Download ARM64 plugin
+        uses: actions/download-artifact@v4
+        with:
+          name: FarFileClipboard-ARM64
+          path: plugin
+
+      - name: Download Far ARM64
+        shell: pwsh
+        run: |
+          Invoke-WebRequest `
+            "https://www.farmanager.com/files/Far30b6699.ARM64.20260614.7z" `
+            -OutFile "far.7z"
+
+      - name: Extract Far
+        shell: pwsh
+        run: |
+          7z x far.7z -ofar
+
+      - name: Install plugin
+        shell: pwsh
+        run: |
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path "far\Plugins\FarFileClipboard" | Out-Null
+
+          Copy-Item `
+            "plugin\*" `
+            "far\Plugins\FarFileClipboard\" `
+            -Recurse `
+            -Force
+
+      - name: Verify plugin DLL load and exports
+        shell: pwsh
+        run: |
+          $dll = (Resolve-Path "far\Plugins\FarFileClipboard\FarFileClipboard.dll").Path
+
+          Add-Type -TypeDefinition @"
+          using System;
+          using System.Runtime.InteropServices;
+
+          public static class NativeLoader
+          {
+              [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+              public static extern IntPtr LoadLibraryW(string lpFileName);
+
+              [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Ansi)]
+              public static extern IntPtr GetProcAddress(IntPtr hModule, string lpProcName);
+
+              [DllImport("kernel32.dll", SetLastError = true)]
+              public static extern bool FreeLibrary(IntPtr hModule);
+          }
+          "@
+
+          $h = [NativeLoader]::LoadLibraryW($dll)
+
+          if ($h -eq [IntPtr]::Zero) {
+              $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+              throw "LoadLibraryW failed. Win32 error: $err"
+          }
+
+          $requiredExports = @(
+            "GetGlobalInfoW",
+            "SetStartupInfoW",
+            "GetPluginInfoW",
+            "OpenW",
+            "ConfigureW"
+          )
+
+          foreach ($name in $requiredExports) {
+              $p = [NativeLoader]::GetProcAddress($h, $name)
+
+              if ($p -eq [IntPtr]::Zero) {
+                  [NativeLoader]::FreeLibrary($h) | Out-Null
+                  throw "Missing export: $name"
+              }
+
+              Write-Host "FOUND EXPORT: $name"
+          }
+
+          [NativeLoader]::FreeLibrary($h) | Out-Null
+
+      - name: Prepare functional test
+        shell: pwsh
+        run: |
+          Remove-Item "test-src" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "test-dst" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "far-profile" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "markers" -Recurse -Force -ErrorAction SilentlyContinue
+
+          New-Item -ItemType Directory -Force -Path "test-src" | Out-Null
+          New-Item -ItemType Directory -Force -Path "test-dst" | Out-Null
+          New-Item -ItemType Directory -Force -Path "markers" | Out-Null
+
+          Set-Content `
+            -Path "test-src\arm64-test.txt" `
+            -Value "FarFileClipboard ARM64 functional test"
+
+      - name: Install LuaMacro functional test
+        shell: pwsh
+        run: |
+          $profile = Join-Path $PWD "far-profile"
+          $macroDir = Join-Path $profile "Macros\scripts"
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $macroDir | Out-Null
+
+          @'
+          local function markerPath(name)
+            local root = win.GetEnv("GITHUB_WORKSPACE")
+            return root .. "\\markers\\" .. name
+          end
+
+          local function mark(name, value)
+            local f = io.open(markerPath(name), "w")
+            if f then
+              f:write(value or "OK")
+              f:close()
+            end
+          end
+
+          local function normalizeGuid(value)
+            if value == nil then
+              return ""
+            end
+            return tostring(value):upper():gsub("[{}]", "")
+          end
+
+          local function fail(name, value)
+            mark(name, value)
+            actl.Quit(20)
+          end
+
+          Macro {
+            area="Shell";
+            flags="RunAfterFARStart";
+            description="FarFileClipboard ARM64 functional test";
+
+            action=function()
+              local pluginName = "FarFileClipboard"
+              local pluginGuid =
+                "6FE2C62E-43E8-45CB-A79A-4FE48547B291"
+              local operationsMenuGuid =
+                "853C895D-C2EC-4931-9BF5-300E55C58418"
+
+              local root = win.GetEnv("GITHUB_WORKSPACE")
+              local src = root .. "\\test-src"
+              local dst = root .. "\\test-dst"
+              local file = "arm64-test.txt"
+              local result = dst .. "\\" .. file
+
+              mark("01-macro-started.txt")
+
+              if not Plugin.Exist(pluginGuid) then
+                fail("90-plugin-not-found.txt")
+                return
+              end
+
+              mark("02-plugin-found.txt")
+
+              if not Panel.SetPath(0, src, file) then
+                fail("91-source-open-failed.txt")
+                return
+              end
+
+              mark("03-source-opened.txt")
+              mark("04-source-current.txt", tostring(APanel.Current))
+
+              if APanel.Current ~= file then
+                fail(
+                  "92-wrong-source-item.txt",
+                  "Expected: " .. file .. "\nActual: " .. tostring(APanel.Current)
+                )
+                return
+              end
+
+              mark("05-source-file-confirmed.txt")
+
+              ----------------------------------------------------------
+              -- COPY
+              -- Use the ordinary Far UI path exactly as a user does:
+              -- F11 -> select FarFileClipboard -> Enter.
+              ----------------------------------------------------------
+
+              Keys("F11")
+
+              if not Area.Menu then
+                fail("93-f11-copy-menu-not-open.txt")
+                return
+              end
+
+              mark("06-f11-copy-menu-open.txt")
+
+              local copyPluginPos = Menu.Select(pluginName, 0)
+              mark("07-copy-plugin-position.txt", tostring(copyPluginPos))
+
+              if not copyPluginPos or copyPluginPos <= 0 then
+                fail("94-copy-plugin-not-in-f11.txt")
+                return
+              end
+
+              Keys("Enter")
+
+              if not Area.Menu then
+                fail("95-copy-operations-menu-not-open.txt")
+                return
+              end
+
+              local copyMenuId = normalizeGuid(Menu.Id)
+              mark("08-copy-operations-menu-id.txt", copyMenuId)
+
+              if copyMenuId ~= operationsMenuGuid then
+                fail(
+                  "96-copy-wrong-operations-menu.txt",
+                  "Expected: " .. operationsMenuGuid ..
+                  "\nActual: " .. copyMenuId
+                )
+                return
+              end
+
+              mark("09-copy-operations-menu-confirmed.txt")
+
+              -- Copy is the first selectable item.
+              Keys("Home Enter")
+              mark("10-copy-selected.txt")
+
+              mf.sleep(500)
+
+              ----------------------------------------------------------
+              -- DESTINATION
+              ----------------------------------------------------------
+
+              if not Panel.SetPath(0, dst) then
+                fail("97-destination-open-failed.txt")
+                return
+              end
+
+              mark("11-destination-opened.txt")
+
+              ----------------------------------------------------------
+              -- PASTE
+              -- Again use F11 -> FarFileClipboard -> internal menu.
+              ----------------------------------------------------------
+
+              Keys("F11")
+
+              if not Area.Menu then
+                fail("98-f11-paste-menu-not-open.txt")
+                return
+              end
+
+              mark("12-f11-paste-menu-open.txt")
+
+              local pastePluginPos = Menu.Select(pluginName, 0)
+              mark("13-paste-plugin-position.txt", tostring(pastePluginPos))
+
+              if not pastePluginPos or pastePluginPos <= 0 then
+                fail("99-paste-plugin-not-in-f11.txt")
+                return
+              end
+
+              Keys("Enter")
+
+              if not Area.Menu then
+                fail("100-paste-operations-menu-not-open.txt")
+                return
+              end
+
+              local pasteMenuId = normalizeGuid(Menu.Id)
+              mark("14-paste-operations-menu-id.txt", pasteMenuId)
+
+              if pasteMenuId ~= operationsMenuGuid then
+                fail(
+                  "101-paste-wrong-operations-menu.txt",
+                  "Expected: " .. operationsMenuGuid ..
+                  "\nActual: " .. pasteMenuId
+                )
+                return
+              end
+
+              mark("15-paste-operations-menu-confirmed.txt")
+
+              -- Paste is item 2: first item + two Down presses.
+              Keys("Home Down Down Enter")
+              mark("16-paste-selected.txt")
+
+              mf.sleep(1500)
+
+              if win.GetFileAttr(result) then
+                mark("17-file-created.txt")
+                actl.Quit(0)
+              else
+                fail("102-file-not-created.txt")
+              end
+            end;
+          }
+          '@ | Set-Content `
+            -Path (Join-Path $macroDir "arm64-functional.lua") `
+            -Encoding UTF8
+
+      - name: Run functional ARM64 test
+        shell: pwsh
+        run: |
+          $profile = (Resolve-Path "far-profile").Path
+          $pluginPath = (Resolve-Path "far\Plugins").Path
+
+          $args = @(
+            "/s",
+            $profile,
+            "/p$pluginPath"
+          )
+
+          $p = Start-Process `
+            ".\far\Far.exe" `
+            -ArgumentList $args `
+            -WorkingDirectory $PWD `
+            -PassThru
+
+          $deadline = (Get-Date).AddSeconds(30)
+
+          while (-not $p.HasExited -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+            $p.Refresh()
+          }
+
+          if (-not $p.HasExited) {
+            Stop-Process -Id $p.Id -Force
+            Write-Host "Far timed out and was terminated."
+          }
+          else {
+            Write-Host "Far exit code: $($p.ExitCode)"
+          }
+
+      - name: Show diagnostic markers
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "===== ARM64 FUNCTIONAL TEST MARKERS ====="
+
+          $markers = Get-ChildItem "markers" `
+            -File `
+            -ErrorAction SilentlyContinue |
+            Sort-Object Name
+
+          if (!$markers) {
+            Write-Host "NO MARKERS CREATED"
+          }
+          else {
+            foreach ($marker in $markers) {
+              Write-Host ""
+              Write-Host "[$($marker.Name)]"
+              Get-Content $marker.FullName
+            }
+          }
+
+          Write-Host ""
+          Write-Host "========================================="
+
+      - name: Verify functional result
+        shell: pwsh
+        run: |
+          $required = @(
+            "01-macro-started.txt",
+            "02-plugin-found.txt",
+            "03-source-opened.txt",
+            "04-source-current.txt",
+            "05-source-file-confirmed.txt",
+            "06-f11-copy-menu-open.txt",
+            "07-copy-plugin-position.txt",
+            "08-copy-operations-menu-id.txt",
+            "09-copy-operations-menu-confirmed.txt",
+            "10-copy-selected.txt",
+            "11-destination-opened.txt",
+            "12-f11-paste-menu-open.txt",
+            "13-paste-plugin-position.txt",
+            "14-paste-operations-menu-id.txt",
+            "15-paste-operations-menu-confirmed.txt",
+            "16-paste-selected.txt",
+            "17-file-created.txt"
+          )
+
+          foreach ($name in $required) {
+            if (!(Test-Path (Join-Path "markers" $name))) {
+              throw "Functional test stopped before marker: $name"
+            }
+          }
+
+          $result = "test-dst\arm64-test.txt"
+
+          if (!(Test-Path $result)) {
+            throw "Copied file not found: $result"
+          }
+
+          $content = Get-Content $result -Raw
+
+          if ($content -notmatch "FarFileClipboard ARM64 functional test") {
+            throw "Copied file content is invalid"
+          }
+
+          Write-Host "ARM64 FarFileClipboard COPY/PASTE functional test PASSED."

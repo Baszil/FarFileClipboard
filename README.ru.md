@@ -69,6 +69,8 @@ build.cmd ARM64
 
 Готовые папки плагина появятся в `dist\FarFileClipboard-x86`, `dist\FarFileClipboard-x64` и `dist\FarFileClipboard-ARM64`.
 
+ARM64 дополнительно проверяется в GitHub Actions на нативном Windows ARM64 runner: запускается ARM64 Far с плагином, плагин обнаруживается через F11, после чего автоматический функциональный тест выполняет Copy/Paste между двумя каталогами панели.
+
 Собрать все три варианта подряд:
 
 ```cmd
