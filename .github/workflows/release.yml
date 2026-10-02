@@ -3,7 +3,7 @@ name: release
 on:
   push:
     tags:
-      - "v1.0.0"
+      - "v*"
 
 permissions:
   contents: write
@@ -39,21 +39,27 @@ jobs:
       - name: Package binary
         shell: pwsh
         run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
           $stage = "package-${{ matrix.arch }}"
+
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item "dist/FarFileClipboard-${{ matrix.arch }}" "$stage/FarFileClipboard" -Recurse
           Copy-Item install.cmd,install.ps1,README.md,README.ru.md $stage/
-          Compress-Archive -Path "$stage/*" -DestinationPath "FarFileClipboard-1.0.0-${{ matrix.arch }}.zip"
+
+          Compress-Archive `
+            -Path "$stage/*" `
+            -DestinationPath "FarFileClipboard-$version-${{ matrix.arch }}.zip"
 
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.arch }}
-          path: FarFileClipboard-1.0.0-${{ matrix.arch }}.zip
+          path: FarFileClipboard-*.zip
           if-no-files-found: error
 
   release:
     needs: binaries
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -64,14 +70,20 @@ jobs:
           merge-multiple: true
 
       - name: Package source
-        run: git archive --format=zip --output FarFileClipboard-1.0.0-source.zip HEAD
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          git archive \
+            --format=zip \
+            --output "FarFileClipboard-${VERSION}-source.zip" \
+            HEAD
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release-assets/FarFileClipboard-1.0.0-x86.zip
-            release-assets/FarFileClipboard-1.0.0-x64.zip
-            release-assets/FarFileClipboard-1.0.0-ARM64.zip
-            FarFileClipboard-1.0.0-source.zip
+            release-assets/FarFileClipboard-*-x86.zip
+            release-assets/FarFileClipboard-*-x64.zip
+            release-assets/FarFileClipboard-*-ARM64.zip
+            FarFileClipboard-*-source.zip
           generate_release_notes: true
