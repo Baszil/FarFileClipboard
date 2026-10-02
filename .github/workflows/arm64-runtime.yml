@@ -1,0 +1,88 @@
+name: ARM64 runtime test
+
+on:
+  push:
+    branches:
+      - arm64-x86-support
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure ARM64
+        run: cmake -S . -B build-ARM64 -G "Visual Studio 17 2022" -A ARM64
+
+      - name: Build ARM64
+        run: cmake --build build-ARM64 --config Release
+
+      - name: Verify ARM64
+        shell: pwsh
+        run: |
+          .\tools\verify-pe.ps1 `
+            -Path "dist\FarFileClipboard-ARM64\FarFileClipboard.dll" `
+            -Expected "ARM64"
+
+      - name: Upload ARM64 plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: FarFileClipboard-ARM64
+          path: dist/FarFileClipboard-ARM64/
+
+  runtime:
+    needs: build
+    runs-on: windows-11-arm
+
+    steps:
+      - name: Download ARM64 plugin
+        uses: actions/download-artifact@v4
+        with:
+          name: FarFileClipboard-ARM64
+          path: plugin
+
+      - name: Download Far ARM64
+        shell: pwsh
+        run: |
+          Invoke-WebRequest `
+            "https://www.farmanager.com/files/Far30b6699_ARM64.20260614.7z" `
+            -OutFile "far.7z"
+
+      - name: Extract Far ARM64
+        shell: pwsh
+        run: |
+          7z x far.7z -ofar
+
+      - name: Install plugin
+        shell: pwsh
+        run: |
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path "far\Plugins\FarFileClipboard" | Out-Null
+
+          Copy-Item `
+            "plugin\*" `
+            "far\Plugins\FarFileClipboard\" `
+            -Recurse `
+            -Force
+
+      - name: Run Far ARM64
+        shell: pwsh
+        run: |
+          $p = Start-Process ".\far\Far.exe" -PassThru
+
+          Start-Sleep -Seconds 5
+
+          if ($p.HasExited) {
+            throw "Far ARM64 exited unexpectedly with code $($p.ExitCode)"
+          }
+
+          Stop-Process -Id $p.Id -Force
+
+          Write-Host "Far ARM64 started successfully with FarFileClipboard installed."
