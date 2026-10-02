@@ -3,7 +3,7 @@ name: ARM64 functional test
 on:
   push:
     branches:
-      - arm64-functional-test
+      - main
   workflow_dispatch:
 
 jobs:
