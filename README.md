@@ -69,6 +69,8 @@ build.cmd ARM64
 
 Runtime directories are created under `dist\FarFileClipboard-x86`, `dist\FarFileClipboard-x64` and `dist\FarFileClipboard-ARM64`.
 
+ARM64 is additionally tested on a native Windows ARM64 GitHub Actions runner: Far ARM64 is launched with the plugin, the plugin is discovered through F11, and an automated Copy/Paste functional test is performed between two panel directories.
+
 Build all three architectures:
 
 ```cmd

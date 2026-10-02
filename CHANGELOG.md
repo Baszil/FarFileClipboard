@@ -6,6 +6,9 @@
 - Added architecture-specific local build/package scripts and CI artifacts.
 - GitHub release workflow now produces x86, x64, ARM64 and source ZIPs.
 - Added x86 Far API ABI layout checks while preserving the existing 64-bit checks.
+- Added a native Windows ARM64 runtime smoke test using ARM64 Far on GitHub Actions.
+- Added a native Windows ARM64 functional test that verifies plugin discovery and performs Copy/Paste through the Far plugin menu between two real panel directories.
+- Added explicit ARM64 DLL load/export diagnostics and PE architecture verification to make CI failures actionable.
 
 
 ## 1.0.0 — 2026-09-30

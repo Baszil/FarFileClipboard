@@ -1,6 +1,6 @@
 ﻿# FarFileClipboard 1.0 — release test checklist
 
-Run the full checklist on Far Manager 3 x64. Repeat the smoke-test subset on x86 and ARM64 before a multi-architecture release.
+Run the full checklist on Far Manager 3 x64. Repeat the smoke-test subset on x86 before a multi-architecture release. ARM64 also has automated runtime and functional coverage in GitHub Actions, but a real-hardware/manual smoke test is still recommended before a public release.
 
 ## Clipboard interoperability
 
@@ -104,7 +104,7 @@ Run this subset on each architecture with a matching Far Manager build:
 
 - x86 Far + x86 plugin: plugin loads, F11 menu opens, configuration opens, Copy/Paste works in both directions with Explorer.
 - x64 Far + x64 plugin: same smoke test, then run the full checklist above.
-- ARM64 Far + ARM64 plugin: plugin loads natively, F11 menu opens, configuration opens, Copy/Paste works in both directions with Explorer.
+- ARM64 Far + ARM64 plugin: plugin loads natively, F11 menu opens, configuration opens, Copy/Paste works in both directions with Explorer. GitHub Actions additionally runs native ARM64 Far on `windows-11-arm` and performs an automated Far-to-Far Copy/Paste functional test through the plugin menu.
 - Verify that a DLL built for the wrong architecture is not used as a substitute for the matching build.
 - For every DLL, check PE machine type with `dumpbin /headers FarFileClipboard.dll` before packaging.
 
@@ -116,4 +116,4 @@ Every local `build.cmd <arch>` run and every GitHub Actions build validates the 
 - x64 = `IMAGE_FILE_MACHINE_AMD64` (`0x8664`)
 - ARM64 = `IMAGE_FILE_MACHINE_ARM64` (`0xAA64`)
 
-This check does not execute an ARM64 DLL on an x64 machine; it proves that the produced binary targets the requested architecture. The ARM64 smoke test still has to be run in ARM64 Far on Windows ARM64.
+The PE check only proves the requested machine type. In addition, `.github/workflows/arm64-runtime.yml` launches ARM64 Far with the ARM64 plugin on a native Windows ARM64 runner, and `.github/workflows/arm64-functional.yml` verifies that Far discovers the plugin and completes a real Copy/Paste operation between two panel directories. Manual ARM64 testing is still useful for Explorer interoperability, dialogs, configuration and other UI behavior not covered by CI.
