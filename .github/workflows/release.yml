@@ -56,8 +56,161 @@ jobs:
           path: FarFileClipboard-*.zip
           if-no-files-found: error
 
-  release:
+  x86-smoke:
+    name: x86 Far release smoke test
     needs: binaries
+    runs-on: windows-2022
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-x86
+          path: x86-package
+
+      - name: Extract x86 release package
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem "x86-package\FarFileClipboard-*-x86.zip" | Select-Object -First 1
+          if (-not $zip) { throw "x86 release ZIP was not downloaded" }
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath "x86-unpacked" -Force
+
+      - name: Verify exact x86 Far API exports
+        shell: pwsh
+        run: |
+          $dll = (Resolve-Path "x86-unpacked\FarFileClipboard\FarFileClipboard.dll").Path
+          ./tools/verify-pe.ps1 -Path $dll -Expected x86
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $vs) { throw "Visual Studio with VC tools not found" }
+          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars32.bat"
+          $exports = cmd /c "`"$vcvars`" >nul && dumpbin /nologo /exports `"$dll`""
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin failed with exit code $LASTEXITCODE" }
+
+          $required = @(
+            "GetGlobalInfoW",
+            "SetStartupInfoW",
+            "GetPluginInfoW",
+            "OpenW",
+            "ConfigureW",
+            "ProcessConsoleInputW",
+            "ProcessSynchroEventW"
+          )
+          foreach ($name in $required) {
+            if (-not ($exports -match "\s$name\s*$")) {
+              $exports | Write-Host
+              throw "Missing undecorated x86 Far API export: $name"
+            }
+          }
+
+      - name: Download Far x86
+        shell: pwsh
+        run: |
+          Invoke-WebRequest `
+            "https://www.farmanager.com/files/Far30b6699.x86.20260614.7z" `
+            -OutFile "far.7z"
+          7z x far.7z -ofar
+
+      - name: Install x86 release plugin and test F11 discovery
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "far\Plugins\FarFileClipboard" | Out-Null
+          Copy-Item "x86-unpacked\FarFileClipboard\*" "far\Plugins\FarFileClipboard\" -Recurse -Force
+
+          $profile = Join-Path $PWD "far-profile"
+          $macroDir = Join-Path $profile "Macros\scripts"
+          $markers = Join-Path $PWD "markers"
+          New-Item -ItemType Directory -Force -Path $macroDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $markers | Out-Null
+
+          @'
+          local function mark(name, value)
+            local root = win.GetEnv("GITHUB_WORKSPACE")
+            local f = io.open(root .. "\\markers\\" .. name, "w")
+            if f then
+              f:write(value or "OK")
+              f:close()
+            end
+          end
+
+          local function fail(name, value)
+            mark(name, value)
+            actl.Quit(20)
+          end
+
+          Macro {
+            area="Shell";
+            flags="RunAfterFARStart";
+            description="FarFileClipboard x86 release load test";
+
+            action=function()
+              local pluginName = "FarFileClipboard"
+              local pluginGuid = "6FE2C62E-43E8-45CB-A79A-4FE48547B291"
+
+              mark("01-macro-started.txt")
+              if not Plugin.Exist(pluginGuid) then
+                fail("90-plugin-not-found.txt")
+                return
+              end
+              mark("02-plugin-found.txt")
+
+              Keys("F11")
+              if not Area.Menu then
+                fail("91-f11-not-open.txt")
+                return
+              end
+              mark("03-f11-open.txt")
+
+              local pos = Menu.Select(pluginName, 0)
+              if not pos or pos <= 0 then
+                fail("92-plugin-not-in-f11.txt", tostring(pos))
+                return
+              end
+              mark("04-plugin-in-f11.txt", tostring(pos))
+              actl.Quit(0)
+            end;
+          }
+          '@ | Set-Content -Path (Join-Path $macroDir "x86-release-load.lua") -Encoding UTF8
+
+          $pluginPath = (Resolve-Path "far\Plugins").Path
+          $p = Start-Process `
+            ".\far\Far.exe" `
+            -ArgumentList @("/s", $profile, "/p$pluginPath") `
+            -WorkingDirectory $PWD `
+            -PassThru
+
+          $deadline = (Get-Date).AddSeconds(30)
+          while (-not $p.HasExited -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+            $p.Refresh()
+          }
+          if (-not $p.HasExited) {
+            Stop-Process -Id $p.Id -Force
+            throw "x86 Far timed out"
+          }
+          if ($p.ExitCode -ne 0) {
+            throw "x86 Far release smoke test failed with exit code $($p.ExitCode)"
+          }
+
+          foreach ($name in @("01-macro-started.txt", "02-plugin-found.txt", "03-f11-open.txt", "04-plugin-in-f11.txt")) {
+            if (!(Test-Path (Join-Path "markers" $name))) {
+              Get-ChildItem "markers" -File -ErrorAction SilentlyContinue | ForEach-Object {
+                Write-Host "[$($_.Name)]"
+                Get-Content $_.FullName
+              }
+              throw "Missing x86 release smoke-test marker: $name"
+            }
+          }
+
+  release:
+    needs:
+      - binaries
+      - x86-smoke
     runs-on: ubuntu-latest
 
     steps:
@@ -68,6 +221,33 @@ jobs:
           pattern: release-*
           path: release-assets
           merge-multiple: true
+
+      - name: Package universal installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGE="universal-stage"
+          rm -rf "$STAGE" universal-unpack
+          mkdir -p "$STAGE" universal-unpack
+
+          for ARCH in x86 x64 ARM64; do
+            ZIP="$(find release-assets -maxdepth 1 -type f -name "FarFileClipboard-*-${ARCH}.zip" -print -quit)"
+            if [[ -z "$ZIP" ]]; then
+              echo "Missing ${ARCH} release ZIP" >&2
+              exit 1
+            fi
+            TMP="universal-unpack/${ARCH}"
+            mkdir -p "$TMP"
+            unzip -q "$ZIP" -d "$TMP"
+            cp -R "$TMP/FarFileClipboard" "$STAGE/FarFileClipboard-${ARCH}"
+          done
+
+          cp install.cmd install.ps1 README.md README.ru.md "$STAGE/"
+          (
+            cd "$STAGE"
+            zip -qr "../FarFileClipboard-${VERSION}-all.zip" .
+          )
 
       - name: Package source
         shell: bash
@@ -85,5 +265,6 @@ jobs:
             release-assets/FarFileClipboard-*-x86.zip
             release-assets/FarFileClipboard-*-x64.zip
             release-assets/FarFileClipboard-*-ARM64.zip
+            FarFileClipboard-*-all.zip
             FarFileClipboard-*-source.zip
           generate_release_notes: true
