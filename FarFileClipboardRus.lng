@@ -57,6 +57,10 @@
 "В буфере Windows нет файловых объектов, которые можно вставить."
 // MOperationFailedPrefix
 "Windows не смогла выполнить операцию. Код ошибки:"
+// MOperationAlreadyRunning
+"Уже выполняется фоновая файловая операция FarFileClipboard."
+// MBackgroundStartFailed
+"Не удалось запустить фоновую файловую операцию."
 // MPastePanelOnly
 "Вставка поддерживается только в обычную файловую панель."
 // MActivePanelNotFs
@@ -86,6 +90,8 @@
 
 // MConfigPrecheckInvalid
 "&Предварительно проверять недопустимые операции"
+// MConfigSystemProgressUi
+"Использовать системное окно прогресса Windows вместо Far"
 // MConfigConflictAsk
 "&Спрашивать, что делать"
 // MConfigConflictSystem
@@ -122,3 +128,24 @@
 "Укажите корректное имя одного файла или каталога."
 // MConflictNameExists
 "Объект с таким именем уже существует. Выберите другое имя."
+
+// MProgressCopy
+"Копирование"
+// MProgressMove
+"Перемещение"
+// MProgressCurrentCopy
+"Копируется:"
+// MProgressCurrentMove
+"Перемещается:"
+// MProgressTotal
+"Общий прогресс"
+// MProgressPreparing
+"Подготовка..."
+// MProgressCancel
+"&Отмена"
+// MProgressCancelling
+"Отмена операции..."
+// MProgressCancelQuestion1
+"Действие было прервано."
+// MProgressCancelQuestion2
+"Вы действительно хотите отменить?"

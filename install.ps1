@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Position = 0)]
     [string] $FarDir,
 
@@ -11,19 +11,58 @@ $ErrorActionPreference = 'Stop'
 $ScriptPath = $PSCommandPath
 $InstallerDir = Split-Path -Parent $ScriptPath
 
-function Get-PluginSource {
-    $candidates = @(
-        (Join-Path $InstallerDir 'dist\FarFileClipboard'),
-        (Join-Path $InstallerDir 'FarFileClipboard')
-    )
-
-    foreach ($candidate in $candidates) {
-        if (Test-Path -LiteralPath (Join-Path $candidate 'FarFileClipboard.dll')) {
-            return (Resolve-Path -LiteralPath $candidate).Path
-        }
+function Get-PeArchitecture([string] $Path) {
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -lt 64 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+        throw ("'{0}' is not a valid PE executable." -f $Path)
     }
 
-    throw 'FarFileClipboard.dll was not found. Run build.cmd first, or keep install.cmd/install.ps1 next to the release FarFileClipboard folder.'
+    $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+    if ($peOffset -lt 0 -or ($peOffset + 6) -gt $bytes.Length) {
+        throw ("'{0}' has an invalid PE header." -f $Path)
+    }
+
+    $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+    switch ($machine) {
+        0x014c { return 'x86' }
+        0x8664 { return 'x64' }
+        0xAA64 { return 'ARM64' }
+        default { throw ("Unsupported PE machine 0x{0:X4} in '{1}'." -f $machine, $Path) }
+    }
+}
+
+function Get-PluginSource([string] $FarDirectory) {
+    # Always decide by the target Far.exe itself.  PowerShell / Windows can be
+    # a different architecture, and a universal package may contain all three
+    # plugin builds side by side.
+    $farExe = Join-Path $FarDirectory 'Far.exe'
+    $arch = Get-PeArchitecture $farExe
+
+    # Universal release layout produced by package-all.cmd / GitHub release:
+    #   FarFileClipboard-x86\...
+    #   FarFileClipboard-x64\...
+    #   FarFileClipboard-ARM64\...
+    $universal = Join-Path $InstallerDir ("FarFileClipboard-{0}" -f $arch)
+    if (Test-Path -LiteralPath (Join-Path $universal 'FarFileClipboard.dll')) {
+        return (Resolve-Path -LiteralPath $universal).Path
+    }
+
+    # Packaged release layout: install.cmd/install.ps1 are next to a
+    # FarFileClipboard directory that already contains the correct DLL.
+    $packaged = Join-Path $InstallerDir 'FarFileClipboard'
+    if (Test-Path -LiteralPath (Join-Path $packaged 'FarFileClipboard.dll')) {
+        return (Resolve-Path -LiteralPath $packaged).Path
+    }
+
+    # Development tree layout produced by build.cmd/build-all.cmd.
+    # Match the source DLL to the architecture of the Far.exe being updated,
+    # not to the architecture of PowerShell or Windows.
+    $built = Join-Path $InstallerDir ("dist\FarFileClipboard-{0}" -f $arch)
+    if (Test-Path -LiteralPath (Join-Path $built 'FarFileClipboard.dll')) {
+        return (Resolve-Path -LiteralPath $built).Path
+    }
+
+    throw ("FarFileClipboard.dll for {0} was not found. Run build.cmd {0} (or build-all.cmd), or keep install.cmd/install.ps1 next to the release FarFileClipboard folder." -f $arch)
 }
 
 function Get-FarFromAncestors {
@@ -188,6 +227,27 @@ function Start-Worker([string] $Directory, [bool] $AsAdmin) {
     }
 }
 
+function Show-InstallPlan([string] $Source, [string] $Directory) {
+    $farExe = Join-Path $Directory 'Far.exe'
+    $sourceDll = Join-Path $Source 'FarFileClipboard.dll'
+    $targetArch = Get-PeArchitecture $farExe
+    $sourceArch = Get-PeArchitecture $sourceDll
+    $destination = Join-Path $Directory 'Plugins\FarFileClipboard'
+
+    if ($sourceArch -ne $targetArch) {
+        throw ("Architecture mismatch: target Far is {0}, but source FarFileClipboard.dll is {1}.`nTarget: {2}`nSource: {3}" -f $targetArch, $sourceArch, $farExe, $sourceDll)
+    }
+
+    Write-Host ''
+    Write-Host 'FarFileClipboard install plan:' -ForegroundColor Cyan
+    Write-Host ("  Target Far:    {0}" -f $farExe)
+    Write-Host ("  Architecture:  {0}" -f $targetArch)
+    Write-Host ("  Source build:  {0}" -f $Source)
+    Write-Host ("  Source DLL:    {0}" -f $sourceDll)
+    Write-Host ("  Destination:   {0}" -f $destination)
+    Write-Host ''
+}
+
 function Install-Plugin([string] $Source, [string] $Directory) {
     $destination = Join-Path $Directory 'Plugins\FarFileClipboard'
     if (-not (Test-Path -LiteralPath $destination)) {
@@ -213,8 +273,6 @@ function Install-Plugin([string] $Source, [string] $Directory) {
 }
 
 try {
-    $source = Get-PluginSource
-
     if ($Worker) {
         $FarDir = Decode-Target $Target64
     }
@@ -225,6 +283,9 @@ try {
     if (-not (Test-Path -LiteralPath (Join-Path $FarDir 'Far.exe'))) {
         throw ("Far.exe was not found in '{0}'." -f $FarDir)
     }
+
+    $source = Get-PluginSource $FarDir
+    Show-InstallPlan $source $FarDir
 
     $destination = Join-Path $FarDir 'Plugins\FarFileClipboard'
     $dll = Join-Path $destination 'FarFileClipboard.dll'

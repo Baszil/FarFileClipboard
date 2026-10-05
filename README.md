@@ -69,6 +69,8 @@ build.cmd ARM64
 
 Runtime directories are created under `dist\FarFileClipboard-x86`, `dist\FarFileClipboard-x64` and `dist\FarFileClipboard-ARM64`.
 
+x86 is tested in a real 32-bit Far process on GitHub Actions: the workflow verifies undecorated Far API exports, discovers the plugin through F11, and performs an automated Copy/Paste between two panel directories.
+
 ARM64 is additionally tested on a native Windows ARM64 GitHub Actions runner: Far ARM64 is launched with the plugin, the plugin is discovered through F11, and an automated Copy/Paste functional test is performed between two panel directories.
 
 Build all three architectures:
@@ -85,11 +87,13 @@ package.cmd x64
 package.cmd ARM64
 ```
 
-Create all three release ZIPs:
+Create all three architecture-specific release ZIPs plus one universal ZIP containing all three builds:
 
 ```cmd
 package-all.cmd
 ```
+
+The universal `FarFileClipboard-1.0.2-all.zip` contains `FarFileClipboard-x86`, `FarFileClipboard-x64` and `FarFileClipboard-ARM64`. The installer reads the PE architecture of the actual target `Far.exe` and selects the matching directory automatically; the architecture of PowerShell or Windows itself does not affect that choice.
 
 ## Install
 
@@ -107,7 +111,7 @@ install.cmd "C:\Path\To\Far Manager"
 
 When `install.cmd` is started from Far, the target path may be omitted: the installer first detects the running parent Far process, then checks `%FARHOME%`, then standard `Program Files` / `Program Files (x86)` locations. If the destination is protected, the installer requests elevation through Windows UAC automatically. If an existing `FarFileClipboard.dll` is loaded by a running Far instance, installation continues in a separate window: close that Far instance and the installer resumes automatically when the DLL is released.
 
-The binary release ZIP includes `install.cmd` and its `install.ps1` worker next to the `FarFileClipboard` directory, so `install.cmd` can be run directly after extraction.
+An architecture-specific release ZIP includes `install.cmd` and its `install.ps1` worker next to the `FarFileClipboard` directory. The universal ZIP keeps the three `FarFileClipboard-x86/x64/ARM64` directories next to the installer. In either case, run `install.cmd` after extraction; before copying it prints the detected `Far.exe`, its architecture, the selected build and the destination, and refuses to install a DLL of the wrong architecture.
 
 If you used the old **FarPaste** or **CopyPaste** prototype, remove its old plugin directory before starting Far. FarFileClipboard intentionally keeps the old plugin GUID. Existing hotkey settings migrate when they already match the current `Ctrl+Shift+letter` model; other legacy combinations fall back to defaults.
 
@@ -122,6 +126,13 @@ Far stores the value internally in its compact form (`CtrlShiftV`), while the pl
 ## File-operation behavior
 
 The same configuration screen contains two independent behavior groups.
+
+**Progress / responsiveness:**
+
+- File transfer work runs on a worker thread; by default Far keeps focus in its modal progress dialog until the operation completes or is cancelled.
+- By default FarFileClipboard shows a compact modal progress dialog styled after Far's native copy progress. Its title is simply **Copying** / **Moving**, not the plugin name. The current-file and overall sections have localized labels; multiple files or a directory show both indicators. The dialog owns Enter/Esc/F10 and mouse input, so keys cannot fall through to the panels. Cancel, Esc and F10 open a Far-style warning with Yes/No confirmation; No resumes the transfer, while Yes interrupts the currently transferring file through the cancellable Win32 copy/move path.
+- Progress redraw requests are coalesced and rate-limited so large directory copies do not starve Far's keyboard/mouse input loop.
+- **Use the Windows system progress window instead of Far** is off by default. Turn it on only if you explicitly prefer the Explorer-style progress dialog.
 
 **Operation checks:**
 

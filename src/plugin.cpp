@@ -1,17 +1,25 @@
-#include "far3sdk_min.hpp"
+﻿#include "far3sdk_min.hpp"
 #include "messages.hpp"
 
 #include <shellapi.h>
 #include <shlobj.h>
 #include <ole2.h>
 #include <shobjidl.h>
+#include <propkeydef.h>
 
 #include <algorithm>
 #include <array>
+#include <cstdarg>
 #include <cwctype>
 #include <cwchar>
+#include <climits>
 #include <cstring>
+#include <atomic>
+#include <new>
+#include <mutex>
+#include <condition_variable>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -42,6 +50,18 @@ constexpr UUID RenameInputGuid =
 constexpr UUID MessageGuid =
 { 0xe31fed3a, 0xad30, 0x47e1, { 0xb2, 0xab, 0x27, 0x7c, 0x3c, 0xd6, 0xc7, 0xc5 } };
 
+constexpr UUID CancelConfirmGuid =
+{ 0xa825bc30, 0xe913, 0x4e0b, { 0xa7, 0x4f, 0xdf, 0x08, 0x4f, 0xdd, 0x4e, 0x53 } };
+
+constexpr UUID ProgressDialogGuid =
+{ 0x55d4329a, 0xd12a, 0x4a43, { 0x88, 0x91, 0x54, 0x65, 0x4f, 0x8b, 0x94, 0x27 } };
+
+// System.Size (PKEY_Size): define it locally instead of pulling in the
+// propkey library symbol, which would otherwise add an easy-to-miss linker
+// dependency just for progress reporting of virtual Shell items.
+constexpr PROPERTYKEY ProgressSizePropertyKey =
+{ { 0xb725f130, 0x47ef, 0x101a, { 0xa5, 0xf1, 0x02, 0x60, 0x8c, 0x9e, 0xeb, 0xac } }, 12 };
+
 constexpr wchar_t DefaultCopyHotkey[]      = L"CtrlShiftC";
 constexpr wchar_t DefaultCutHotkey[]       = L"CtrlShiftX";
 constexpr wchar_t DefaultPasteHotkey[]     = L"CtrlShiftV";
@@ -58,6 +78,7 @@ constexpr wchar_t LegacyHotkeySetting[] = L"Hotkey";
 constexpr wchar_t PrecheckInvalidSetting[] = L"PrecheckInvalidOperations";
 constexpr wchar_t ConflictModeSetting[] = L"ConflictMode";
 constexpr wchar_t AutoRenameTemplateSetting[] = L"AutoRenameTemplate";
+constexpr wchar_t SystemProgressUiSetting[] = L"SystemProgressUi";
 constexpr wchar_t DefaultAutoRenameTemplate[] = L"{name} ({n}){ext}";
 
 enum class ConflictMode : unsigned long long
@@ -77,6 +98,219 @@ std::wstring g_RedoHotkey = DefaultRedoHotkey;
 bool g_PrecheckInvalidOperations = true;
 ConflictMode g_ConflictMode = ConflictMode::Ask;
 std::wstring g_AutoRenameTemplate = DefaultAutoRenameTemplate;
+bool g_SystemProgressUi = false;
+std::atomic<bool> g_BackgroundOperationRunning{ false };
+
+// The default progress UI belongs to Far itself, not to Explorer.  Worker
+// threads never touch Dialog API directly; they only queue ACTL_SYNCHRO and
+// the actual UI update is performed in Far's main thread.
+HANDLE g_ProgressDialog = nullptr;
+std::atomic<bool> g_NativeProgressActive{ false };
+std::atomic<bool> g_ProgressDialogClosing{ false };
+std::atomic<bool> g_ProgressDialogRunning{ false };
+std::atomic<bool> g_ProgressCancelRequested{ false };
+// While the Far-style confirmation is on screen, freeze the worker at the
+// next progress / item boundary.  A negative answer resumes the same transfer;
+// a positive answer arms the real Win32 cancellation path.
+std::atomic<bool> g_ProgressCancelPromptActive{ false };
+std::mutex g_ProgressCancelPromptMutex;
+std::condition_variable g_ProgressCancelPromptCv;
+// CopyFileEx can also observe an LPBOOL cancellation flag independently of
+// our progress callback.  Keep both mechanisms: the raw Far input path sets
+// this flag immediately, while the callback also returns PROGRESS_CANCEL.
+volatile LONG g_ProgressWin32CancelFlag = FALSE;
+std::atomic<unsigned int> g_ProgressTotal{ 0 };
+std::atomic<unsigned int> g_ProgressDone{ 0 };
+std::atomic<bool> g_ProgressShowTotal{ false };
+std::atomic<unsigned long long> g_ProgressCurrentTotalBytes{ 0 };
+std::atomic<unsigned long long> g_ProgressCurrentDoneBytes{ 0 };
+std::atomic<unsigned long long> g_ProgressOverallTotalBytes{ 0 };
+std::atomic<unsigned long long> g_ProgressOverallDoneBytes{ 0 };
+std::atomic<bool> g_ProgressCurrentTargetObservedChange{ false };
+std::atomic<bool> g_ProgressSyncQueued{ false };
+std::atomic<unsigned long long> g_ProgressRedrawGeneration{ 0 };
+std::atomic<unsigned long long> g_ProgressLastSyncTick{ 0 };
+std::atomic<bool> g_ProgressForceRedrawPending{ false };
+constexpr unsigned long long ProgressRedrawIntervalMs = 50;
+std::mutex g_ProgressNameMutex;
+std::wstring g_ProgressName;
+std::wstring g_ProgressCurrentTargetPath;
+unsigned long long g_ProgressCurrentTargetInitialSize = 0;
+FILETIME g_ProgressCurrentTargetInitialWriteTime{};
+bool g_ProgressCurrentTargetInitiallyExisted = false;
+std::wstring g_ProgressOverallBarText;
+std::wstring g_ProgressCurrentBarText;
+std::wstring g_ProgressDetailText;
+char g_ProgressSyncToken = 0;
+
+// ---------------------------------------------------------------------------
+// Optional cancellation diagnostics.
+//
+// Release builds compile this out completely. It can be enabled explicitly
+// with -DFFC_CANCEL_DIAGNOSTICS=ON when reproducing input/cancellation issues.
+// ---------------------------------------------------------------------------
+#ifdef FFC_CANCEL_DIAGNOSTICS
+std::mutex g_DebugLogMutex;
+std::atomic<unsigned long long> g_DebugLogSequence{ 0 };
+
+const std::wstring& DebugLogPath()
+{
+    static const std::wstring path = []()
+    {
+        wchar_t tempPath[MAX_PATH + 2]{};
+        constexpr size_t tempPathCount = sizeof(tempPath) / sizeof(tempPath[0]);
+        const DWORD length = GetTempPathW(static_cast<DWORD>(tempPathCount), tempPath);
+        if (length > 0 && length < tempPathCount)
+            return std::wstring(tempPath) + L"FarFileClipboard-cancel-debug.log";
+        return std::wstring(L"FarFileClipboard-cancel-debug.log");
+    }();
+    return path;
+}
+
+void WriteDebugLogBytes(const char* data, DWORD size)
+{
+    HANDLE file = CreateFileW(
+        DebugLogPath().c_str(),
+        FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return;
+
+    DWORD written = 0;
+    WriteFile(file, data, size, &written, nullptr);
+    // Do not FlushFileBuffers() for every diagnostic record.  This logger runs
+    // on Far's input thread too; forcing a physical flush per key/mouse event
+    // measurably harms the very responsiveness we are trying to diagnose.
+    CloseHandle(file);
+}
+
+void DebugLog(const wchar_t* format, ...)
+{
+    wchar_t message[2048]{};
+    constexpr size_t messageCount = sizeof(message) / sizeof(message[0]);
+    va_list args;
+    va_start(args, format);
+    const int formatted = std::vswprintf(message, messageCount, format, args);
+    va_end(args);
+    if (formatted < 0)
+        return;
+
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    const unsigned long long sequence = g_DebugLogSequence.fetch_add(1) + 1;
+
+    wchar_t line[2600]{};
+    constexpr size_t lineCount = sizeof(line) / sizeof(line[0]);
+    const int lineLength = swprintf_s(
+        line,
+        lineCount,
+        L"%06llu %02u:%02u:%02u.%03u pid=%lu tid=%lu | %ls\r\n",
+        sequence,
+        now.wHour,
+        now.wMinute,
+        now.wSecond,
+        now.wMilliseconds,
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        message);
+    if (lineLength <= 0)
+        return;
+
+    const int utf8Length = WideCharToMultiByte(
+        CP_UTF8, 0, line, lineLength, nullptr, 0, nullptr, nullptr);
+    if (utf8Length <= 0)
+        return;
+
+    std::string utf8(static_cast<size_t>(utf8Length), '\0');
+    WideCharToMultiByte(
+        CP_UTF8, 0, line, lineLength, utf8.data(), utf8Length, nullptr, nullptr);
+
+    std::lock_guard<std::mutex> lock(g_DebugLogMutex);
+    WriteDebugLogBytes(utf8.data(), static_cast<DWORD>(utf8.size()));
+}
+
+void ResetDebugLog()
+{
+    std::lock_guard<std::mutex> lock(g_DebugLogMutex);
+    HANDLE file = CreateFileW(
+        DebugLogPath().c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        static constexpr unsigned char Utf8Bom[] = { 0xEF, 0xBB, 0xBF };
+        DWORD written = 0;
+        WriteFile(file, Utf8Bom, sizeof(Utf8Bom), &written, nullptr);
+        FlushFileBuffers(file);
+        CloseHandle(file);
+    }
+    g_DebugLogSequence.store(0);
+}
+
+const wchar_t* DebugDialogMessageName(intptr_t msg)
+{
+    switch (msg)
+    {
+    case DN_BTNCLICK: return L"DN_BTNCLICK";
+    case DN_INITDIALOG: return L"DN_INITDIALOG";
+    case DN_INPUT: return L"DN_INPUT";
+    case DN_CONTROLINPUT: return L"DN_CONTROLINPUT";
+    case DN_CLOSE: return L"DN_CLOSE";
+    default: return L"DN_OTHER";
+    }
+}
+
+void DebugLogInputRecord(const wchar_t* source, const INPUT_RECORD& input)
+{
+    if (input.EventType == KEY_EVENT)
+    {
+        const auto& key = input.Event.KeyEvent;
+        DebugLog(
+            L"%ls KEY down=%d repeat=%u vk=0x%04X scan=0x%04X char=U+%04X ctrl=0x%08lX",
+            source,
+            key.bKeyDown ? 1 : 0,
+            static_cast<unsigned>(key.wRepeatCount),
+            static_cast<unsigned>(key.wVirtualKeyCode),
+            static_cast<unsigned>(key.wVirtualScanCode),
+            static_cast<unsigned>(key.uChar.UnicodeChar),
+            static_cast<unsigned long>(key.dwControlKeyState));
+        return;
+    }
+
+    if (input.EventType == MOUSE_EVENT)
+    {
+        const auto& mouse = input.Event.MouseEvent;
+        // Do not flood the log with plain mouse-move notifications.  Button,
+        // wheel and double-click events are what matter for cancellation.
+        if (mouse.dwButtonState != 0 || mouse.dwEventFlags != MOUSE_MOVED)
+        {
+            DebugLog(
+                L"%ls MOUSE x=%d y=%d buttons=0x%08lX ctrl=0x%08lX flags=0x%08lX",
+                source,
+                static_cast<int>(mouse.dwMousePosition.X),
+                static_cast<int>(mouse.dwMousePosition.Y),
+                static_cast<unsigned long>(mouse.dwButtonState),
+                static_cast<unsigned long>(mouse.dwControlKeyState),
+                static_cast<unsigned long>(mouse.dwEventFlags));
+        }
+        return;
+    }
+
+    DebugLog(L"%ls INPUT eventType=0x%04X", source, static_cast<unsigned>(input.EventType));
+}
+#else
+#define DebugLog(...) ((void)0)
+#define DebugLogInputRecord(...) ((void)0)
+inline void ResetDebugLog() {}
+#endif
 
 struct HotkeySpec
 {
@@ -120,6 +354,75 @@ struct FileActionRecord
 {
     FileAction Action = FileAction::None;
     std::vector<FileActionItem> Items;
+};
+
+enum class BackgroundJobType
+{
+    FileSystemPaste,
+    ShellPaste
+};
+
+struct BackgroundJobBase
+{
+    BackgroundJobType Type = BackgroundJobType::FileSystemPaste;
+};
+
+struct BackgroundPasteItem
+{
+    std::wstring Source;
+    std::wstring Target;
+};
+
+enum class BackgroundPasteKind
+{
+    ToDirectory,
+    ExactTargets
+};
+
+struct BackgroundPasteJob : BackgroundJobBase
+{
+    BackgroundPasteJob() { Type = BackgroundJobType::FileSystemPaste; }
+    BackgroundPasteKind Kind = BackgroundPasteKind::ExactTargets;
+    bool Move = false;
+    bool AllowSystemConflictUi = false;
+    bool ShowSystemProgressUi = false;
+    std::wstring DestinationDirectory;
+    std::vector<BackgroundPasteItem> Items;
+    std::vector<std::wstring> OriginalSources;
+    DWORD ClipboardSequenceAtStart = 0;
+    FileActionRecord Candidate{};
+    bool CandidateSafe = false;
+
+    bool AnyPerformed = false;
+    bool Failed = false;
+    bool Aborted = false;
+    int ErrorCode = 0;
+};
+
+struct BackgroundShellPastePlanItem
+{
+    DWORD Index = 0;
+    std::wstring NewName;
+};
+
+struct BackgroundShellPasteJob : BackgroundJobBase
+{
+    BackgroundShellPasteJob() { Type = BackgroundJobType::ShellPaste; }
+    ~BackgroundShellPasteJob()
+    {
+        if (MarshaledDataObject)
+            MarshaledDataObject->Release();
+    }
+    IStream* MarshaledDataObject = nullptr;
+    std::wstring DestinationDirectory;
+    std::vector<BackgroundShellPastePlanItem> Plan;
+    bool UsePlan = false;
+    bool Move = false;
+    bool AllowSystemConflictUi = false;
+    bool ShowSystemProgressUi = false;
+    DWORD ClipboardSequenceAtStart = 0;
+    HRESULT Result = S_OK;
+    bool Aborted = false;
 };
 
 FileActionRecord g_UndoRecord{};
@@ -314,6 +617,1760 @@ void ShowMessage(const std::wstring& text, bool warning = false)
         reinterpret_cast<const wchar_t* const*>(body.c_str()),
         0,
         0);
+}
+
+void WaitWhileProgressCancelPromptActive()
+{
+    if (!g_ProgressCancelPromptActive.load())
+        return;
+
+    std::unique_lock<std::mutex> lock(g_ProgressCancelPromptMutex);
+    g_ProgressCancelPromptCv.wait(lock, []
+    {
+        return !g_ProgressCancelPromptActive.load();
+    });
+}
+
+bool ShowProgressCancelConfirmation()
+{
+    if (!g_Info.Message)
+        return true;
+
+    const std::wstring body =
+        std::wstring(Msg(MWarningTitle)) + L"\n" +
+        Msg(MProgressCancelQuestion1) + L"\n" +
+        Msg(MProgressCancelQuestion2);
+
+    const intptr_t result = g_Info.Message(
+        &PluginGuid,
+        &CancelConfirmGuid,
+        FMSG_WARNING | FMSG_ALLINONE | FMSG_MB_YESNO,
+        nullptr,
+        reinterpret_cast<const wchar_t* const*>(body.c_str()),
+        0,
+        0);
+    DebugLog(L"cancel confirmation result=%lld (0=yes)", static_cast<long long>(result));
+    return result == 0;
+}
+
+
+enum NativeProgressItem : intptr_t
+{
+    ProgressBox = 0,
+    ProgressCurrentLabel,
+    ProgressDetail,
+    ProgressCurrentBar,
+    ProgressTotalSeparator,
+    ProgressTotalBar,
+    ProgressSeparator,
+    ProgressCancel,
+    ProgressCount
+};
+
+intptr_t WINAPI ProgressDialogProc(HANDLE dialog, intptr_t msg, intptr_t param1, void* param2)
+{
+    auto commitCancel = [dialog]()
+    {
+        const bool alreadyRequested = g_ProgressCancelRequested.exchange(true);
+        DebugLog(
+            L"commitCancel dialog=%p alreadyRequested=%d win32Flag(before)=%ld",
+            dialog,
+            alreadyRequested ? 1 : 0,
+            static_cast<long>(InterlockedCompareExchange(&g_ProgressWin32CancelFlag, FALSE, FALSE)));
+        if (alreadyRequested)
+            return;
+
+        InterlockedExchange(&g_ProgressWin32CancelFlag, TRUE);
+        DebugLog(
+            L"commitCancel armed: cancelRequested=%d win32Flag(after)=%ld",
+            g_ProgressCancelRequested.load() ? 1 : 0,
+            static_cast<long>(InterlockedCompareExchange(&g_ProgressWin32CancelFlag, FALSE, FALSE)));
+
+        if (g_Info.SendDlgMessage)
+        {
+            g_Info.SendDlgMessage(
+                dialog,
+                DM_SETTEXTPTR,
+                ProgressDetail,
+                const_cast<wchar_t*>(Msg(MProgressCancelling)));
+            g_Info.SendDlgMessage(dialog, DM_ENABLE, ProgressCancel, nullptr);
+            g_Info.SendDlgMessage(dialog, DM_REDRAW, 0, nullptr);
+        }
+    };
+
+    auto confirmCancel = [dialog, &commitCancel]()
+    {
+        if (g_ProgressCancelRequested.load())
+            return;
+
+        bool expected = false;
+        if (!g_ProgressCancelPromptActive.compare_exchange_strong(expected, true))
+            return;
+
+        DebugLog(L"cancel confirmation OPEN dialog=%p", dialog);
+        const bool confirmed = ShowProgressCancelConfirmation();
+        DebugLog(L"cancel confirmation CLOSE confirmed=%d", confirmed ? 1 : 0);
+
+        if (confirmed)
+            commitCancel();
+
+        g_ProgressCancelPromptActive.store(false);
+        g_ProgressCancelPromptCv.notify_all();
+
+        if (!confirmed && g_Info.SendDlgMessage)
+        {
+            g_Info.SendDlgMessage(dialog, DM_SETFOCUS, ProgressCancel, nullptr);
+            g_Info.SendDlgMessage(dialog, DM_REDRAW, 0, nullptr);
+        }
+    };
+
+    auto keyMeansCancel = [](const INPUT_RECORD& input)
+    {
+        if (input.EventType != KEY_EVENT || !input.Event.KeyEvent.bKeyDown)
+            return false;
+
+        const WORD key = input.Event.KeyEvent.wVirtualKeyCode;
+        return key == VK_ESCAPE || key == VK_F10 || key == VK_RETURN || key == VK_SPACE;
+    };
+
+    auto mouseHitsCancel = [dialog](const INPUT_RECORD& input)
+    {
+        if (input.EventType != MOUSE_EVENT || !g_Info.SendDlgMessage)
+            return false;
+
+        const auto& mouse = input.Event.MouseEvent;
+        if ((mouse.dwButtonState & FROM_LEFT_1ST_BUTTON_PRESSED) == 0)
+            return false;
+
+        SMALL_RECT dialogRect{};
+        SMALL_RECT buttonRect{};
+        const intptr_t dlgRectResult = g_Info.SendDlgMessage(dialog, DM_GETDLGRECT, 0, &dialogRect);
+        const intptr_t buttonRectResult = g_Info.SendDlgMessage(
+            dialog, DM_GETITEMPOSITION, ProgressCancel, &buttonRect);
+        if (!dlgRectResult || !buttonRectResult)
+        {
+            DebugLog(
+                L"mouseHitsCancel rect query failed dlgResult=%lld buttonResult=%lld",
+                static_cast<long long>(dlgRectResult),
+                static_cast<long long>(buttonRectResult));
+            return false;
+        }
+
+        const SHORT left = static_cast<SHORT>(dialogRect.Left + buttonRect.Left);
+        const SHORT right = static_cast<SHORT>(dialogRect.Left + buttonRect.Right);
+        const SHORT top = static_cast<SHORT>(dialogRect.Top + buttonRect.Top);
+        const SHORT bottom = static_cast<SHORT>(dialogRect.Top + buttonRect.Bottom);
+        const COORD pos = mouse.dwMousePosition;
+        const bool hit = pos.X >= left && pos.X <= right && pos.Y >= top && pos.Y <= bottom;
+        DebugLog(
+            L"mouseHitsCancel pos=(%d,%d) dlg=(%d,%d,%d,%d) buttonRel=(%d,%d,%d,%d) buttonAbs=(%d,%d,%d,%d) hit=%d",
+            static_cast<int>(pos.X), static_cast<int>(pos.Y),
+            static_cast<int>(dialogRect.Left), static_cast<int>(dialogRect.Top),
+            static_cast<int>(dialogRect.Right), static_cast<int>(dialogRect.Bottom),
+            static_cast<int>(buttonRect.Left), static_cast<int>(buttonRect.Top),
+            static_cast<int>(buttonRect.Right), static_cast<int>(buttonRect.Bottom),
+            static_cast<int>(left), static_cast<int>(top),
+            static_cast<int>(right), static_cast<int>(bottom),
+            hit ? 1 : 0);
+        return hit;
+    };
+
+    if (msg == DN_INITDIALOG)
+    {
+        DebugLog(
+            L"ProgressDialogProc %ls dialog=%p param1=%lld param2=%p",
+            DebugDialogMessageName(msg), dialog,
+            static_cast<long long>(param1), param2);
+        // DN_INPUT arrives *before* Far's own input handling.  This matters:
+        // swallowing Esc/F10 here prevents the key from leaking to the panel.
+        // We deliberately show our own Far warning / Yes-No confirmation so
+        // plugin copy behaves like ordinary Far F5/F6 copy.  DN_CONTROLINPUT
+        // is kept below only as a fallback.
+        if (g_Info.SendDlgMessage)
+        {
+            const intptr_t inputNotifyResult = g_Info.SendDlgMessage(
+                dialog, DM_SETINPUTNOTIFY, 1, nullptr);
+            const intptr_t focusResult = g_Info.SendDlgMessage(
+                dialog, DM_SETFOCUS, ProgressCancel, nullptr);
+            const intptr_t actualFocus = g_Info.SendDlgMessage(dialog, DM_GETFOCUS, 0, nullptr);
+            DebugLog(
+                L"DN_INITDIALOG inputNotifyResult=%lld focusResult=%lld actualFocus=%lld expectedFocus=%lld",
+                static_cast<long long>(inputNotifyResult),
+                static_cast<long long>(focusResult),
+                static_cast<long long>(actualFocus),
+                static_cast<long long>(ProgressCancel));
+        }
+        const intptr_t defResult = g_Info.DefDlgProc
+            ? g_Info.DefDlgProc(dialog, msg, param1, param2)
+            : 1;
+        DebugLog(L"DN_INITDIALOG DefDlgProc -> %lld", static_cast<long long>(defResult));
+        return defResult;
+    }
+
+    if (msg == DN_INPUT && param2)
+    {
+        const auto& input = *static_cast<const INPUT_RECORD*>(param2);
+        if (input.EventType == 0)
+            return 1;
+        DebugLogInputRecord(L"DN_INPUT", input);
+        const bool keyCancel = keyMeansCancel(input);
+        const bool mouseCancel = mouseHitsCancel(input);
+        DebugLog(L"DN_INPUT cancelMatch key=%d mouse=%d", keyCancel ? 1 : 0, mouseCancel ? 1 : 0);
+        if (keyCancel || mouseCancel)
+        {
+            confirmCancel();
+            // DN_INPUT uses the inverse convention from DN_CONTROLINPUT:
+            // FALSE means "handled by plugin, do not let Far process it".
+            return 0;
+        }
+        return 1;
+    }
+
+    if (msg == DN_BTNCLICK && param1 == ProgressCancel)
+    {
+        DebugLog(
+            L"ProgressDialogProc DN_BTNCLICK CANCEL dialog=%p param1=%lld param2=%p",
+            dialog, static_cast<long long>(param1), param2);
+        confirmCancel();
+        return 1;
+    }
+
+    if (msg == DN_BTNCLICK)
+    {
+        DebugLog(
+            L"ProgressDialogProc DN_BTNCLICK OTHER dialog=%p param1=%lld param2=%p",
+            dialog, static_cast<long long>(param1), param2);
+    }
+
+    if (msg == DN_CONTROLINPUT && param2)
+    {
+        const auto& input = *static_cast<const INPUT_RECORD*>(param2);
+        if (input.EventType == 0)
+            return g_Info.DefDlgProc ? g_Info.DefDlgProc(dialog, msg, param1, param2) : 0;
+        DebugLogInputRecord(L"DN_CONTROLINPUT", input);
+        const bool keyCancel = keyMeansCancel(input);
+        const bool mouseCancel = mouseHitsCancel(input);
+        DebugLog(
+            L"DN_CONTROLINPUT cancelMatch key=%d mouse=%d",
+            keyCancel ? 1 : 0,
+            mouseCancel ? 1 : 0);
+        if (keyCancel || mouseCancel)
+        {
+            confirmCancel();
+            // DN_CONTROLINPUT: TRUE means the plugin consumed the event.
+            return 1;
+        }
+    }
+
+    if (msg == DN_CLOSE)
+    {
+        DebugLog(
+            L"ProgressDialogProc DN_CLOSE dialog=%p param1=%lld closing=%d cancelRequested=%d",
+            dialog,
+            static_cast<long long>(param1),
+            g_ProgressDialogClosing.load() ? 1 : 0,
+            g_ProgressCancelRequested.load() ? 1 : 0);
+        if (g_ProgressDialogClosing.load())
+        {
+            DebugLog(L"DN_CLOSE accepted: internal worker-completion close");
+            return 1;
+        }
+
+        // User close attempts ask for confirmation, exactly like ordinary Far
+        // copy.  Keep the progress dialog alive unless the worker itself ends.
+        confirmCancel();
+        DebugLog(L"DN_CLOSE rejected after converting it to cancel request");
+        return 0;
+    }
+
+    return g_Info.DefDlgProc ? g_Info.DefDlgProc(dialog, msg, param1, param2) : 0;
+}
+
+bool GetProgressPathInfo(
+    const std::wstring& path,
+    unsigned long long& size,
+    FILETIME& writeTime,
+    bool& directory)
+{
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data))
+        return false;
+
+    directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    ULARGE_INTEGER value{};
+    value.HighPart = data.nFileSizeHigh;
+    value.LowPart = data.nFileSizeLow;
+    size = directory ? 0ULL : value.QuadPart;
+    writeTime = data.ftLastWriteTime;
+    return true;
+}
+
+std::wstring JoinProgressPath(const std::wstring& directory, const std::wstring& name)
+{
+    if (directory.empty())
+        return name;
+    if (directory.back() == L'\\' || directory.back() == L'/')
+        return directory + name;
+    return directory + L"\\" + name;
+}
+
+std::wstring ProgressBaseName(const std::wstring& path)
+{
+    const size_t pos = path.find_last_of(L"\\/");
+    return pos == std::wstring::npos ? path : path.substr(pos + 1);
+}
+
+bool GetShellItemProgressPath(IShellItem* item, std::wstring& path)
+{
+    path.clear();
+    if (!item)
+        return false;
+
+    PWSTR raw = nullptr;
+    const HRESULT hr = item->GetDisplayName(SIGDN_FILESYSPATH, &raw);
+    if (FAILED(hr) || !raw || !*raw)
+    {
+        if (raw)
+            CoTaskMemFree(raw);
+        return false;
+    }
+
+    path = raw;
+    CoTaskMemFree(raw);
+    return true;
+}
+
+bool GetShellItemProgressSize(IShellItem* item, unsigned long long& size)
+{
+    size = 0;
+    if (!item)
+        return false;
+
+    IShellItem2* item2 = nullptr;
+    if (FAILED(item->QueryInterface(IID_PPV_ARGS(&item2))) || !item2)
+        return false;
+
+    ULONGLONG value = 0;
+    const HRESULT hr = item2->GetUInt64(ProgressSizePropertyKey, &value);
+    item2->Release();
+    if (FAILED(hr))
+        return false;
+
+    size = static_cast<unsigned long long>(value);
+    return true;
+}
+
+void SetCurrentProgressItem(
+    IShellItem* item,
+    IShellItem* destinationFolder,
+    LPCWSTR requestedName)
+{
+    std::wstring sourcePath;
+    std::wstring destinationPath;
+    std::wstring displayName;
+    unsigned long long sourceSize = 0;
+    FILETIME sourceWrite{};
+    bool sourceDirectory = false;
+
+    if (GetShellItemProgressPath(item, sourcePath))
+    {
+        displayName = ProgressBaseName(sourcePath);
+        GetProgressPathInfo(sourcePath, sourceSize, sourceWrite, sourceDirectory);
+    }
+    else if (item)
+    {
+        PWSTR rawName = nullptr;
+        if (SUCCEEDED(item->GetDisplayName(SIGDN_NORMALDISPLAY, &rawName)) && rawName)
+        {
+            displayName = rawName;
+            CoTaskMemFree(rawName);
+        }
+    }
+
+    if (item && sourcePath.empty())
+    {
+        SFGAOF attributes = 0;
+        if (SUCCEEDED(item->GetAttributes(SFGAO_FOLDER, &attributes)))
+            sourceDirectory = (attributes & SFGAO_FOLDER) != 0;
+
+        // Explorer ZIP and other virtual Shell items have no filesystem
+        // source path, but they often expose PKEY_Size.  Using it lets the
+        // current-file indicator remain genuinely per-file instead of merely
+        // mirroring the overall IFileOperation work estimate.
+        if (!sourceDirectory)
+            GetShellItemProgressSize(item, sourceSize);
+    }
+
+    std::wstring destinationDirectory;
+    if (GetShellItemProgressPath(destinationFolder, destinationDirectory))
+    {
+        std::wstring targetName = requestedName && *requestedName
+            ? std::wstring(requestedName)
+            : displayName;
+        if (!targetName.empty())
+            destinationPath = JoinProgressPath(destinationDirectory, targetName);
+    }
+
+    unsigned long long initialSize = 0;
+    FILETIME initialWrite{};
+    bool initialDirectory = false;
+    const bool targetExisted = !destinationPath.empty() &&
+        GetProgressPathInfo(destinationPath, initialSize, initialWrite, initialDirectory) &&
+        !initialDirectory;
+
+    {
+        std::lock_guard<std::mutex> lock(g_ProgressNameMutex);
+        g_ProgressName = displayName;
+        g_ProgressCurrentTargetPath = destinationPath;
+        g_ProgressCurrentTargetInitialSize = initialSize;
+        g_ProgressCurrentTargetInitialWriteTime = initialWrite;
+        g_ProgressCurrentTargetInitiallyExisted = targetExisted;
+    }
+
+    g_ProgressCurrentTargetObservedChange.store(!targetExisted);
+    g_ProgressCurrentTotalBytes.store(sourceDirectory ? 0ULL : sourceSize);
+    g_ProgressCurrentDoneBytes.store(0ULL);
+}
+
+void RefreshCurrentProgressFromTarget()
+{
+    const unsigned long long total = g_ProgressCurrentTotalBytes.load();
+    if (!total)
+        return;
+
+    std::wstring targetPath;
+    unsigned long long initialSize = 0;
+    FILETIME initialWrite{};
+    bool initiallyExisted = false;
+    {
+        std::lock_guard<std::mutex> lock(g_ProgressNameMutex);
+        targetPath = g_ProgressCurrentTargetPath;
+        initialSize = g_ProgressCurrentTargetInitialSize;
+        initialWrite = g_ProgressCurrentTargetInitialWriteTime;
+        initiallyExisted = g_ProgressCurrentTargetInitiallyExisted;
+    }
+
+    if (targetPath.empty())
+        return;
+
+    unsigned long long currentSize = 0;
+    FILETIME currentWrite{};
+    bool directory = false;
+    if (!GetProgressPathInfo(targetPath, currentSize, currentWrite, directory) || directory)
+        return;
+
+    bool changed = g_ProgressCurrentTargetObservedChange.load();
+    if (!changed && initiallyExisted)
+    {
+        changed = currentSize != initialSize ||
+            CompareFileTime(&currentWrite, &initialWrite) != 0;
+        if (changed)
+            g_ProgressCurrentTargetObservedChange.store(true);
+    }
+
+    if (!initiallyExisted || changed)
+        g_ProgressCurrentDoneBytes.store(std::min(currentSize, total));
+}
+
+void CompleteCurrentProgressItem()
+{
+    const unsigned long long total = g_ProgressCurrentTotalBytes.load();
+    if (total)
+        g_ProgressCurrentDoneBytes.store(total);
+}
+
+std::wstring MakeProgressBar(unsigned int percent, size_t width = 66)
+{
+    // Keep the indicator visually close to Far's own text-mode progress:
+    // solid cells for completed work, a quiet shaded remainder and a compact
+    // percentage at the right.  Deliberately no [] ruler and no plugin name.
+    percent = std::min(percent, 100U);
+
+    wchar_t percentText[16]{};
+    swprintf_s(percentText, L" %3u%%", percent);
+    const size_t percentLength = wcslen(percentText);
+    const size_t barWidth = width > percentLength ? width - percentLength : 0;
+    const size_t filled = (barWidth * percent) / 100;
+
+    // Far-like text progress: solid completed cells and an explicit light
+    // dotted / shaded remainder, rather than the dialog background.
+    std::wstring text(filled, L'\x2588'); // █ completed
+    text.append(barWidth - filled, L'\x2591'); // ░ remaining
+    text += percentText;
+    return text;
+}
+
+void BeginNativeProgress(bool move, bool showSystemProgressUi, bool showTotal)
+{
+    DebugLog(
+        L"BeginNativeProgress move=%d showSystemProgressUi=%d showTotal=%d",
+        move ? 1 : 0,
+        showSystemProgressUi ? 1 : 0,
+        showTotal ? 1 : 0);
+    g_ProgressCancelRequested.store(false);
+    g_ProgressCancelPromptActive.store(false);
+    g_ProgressCancelPromptCv.notify_all();
+    InterlockedExchange(&g_ProgressWin32CancelFlag, FALSE);
+    g_ProgressTotal.store(0);
+    g_ProgressDone.store(0);
+    g_ProgressShowTotal.store(showTotal);
+    g_ProgressCurrentTotalBytes.store(0);
+    g_ProgressCurrentDoneBytes.store(0);
+    g_ProgressOverallTotalBytes.store(0);
+    g_ProgressOverallDoneBytes.store(0);
+    g_ProgressCurrentTargetObservedChange.store(false);
+    g_ProgressSyncQueued.store(false);
+    g_ProgressRedrawGeneration.store(0);
+    g_ProgressLastSyncTick.store(0);
+    g_ProgressForceRedrawPending.store(false);
+    g_ProgressDialogClosing.store(false);
+    g_ProgressDialogRunning.store(false);
+    {
+        std::lock_guard<std::mutex> lock(g_ProgressNameMutex);
+        g_ProgressName.clear();
+        g_ProgressCurrentTargetPath.clear();
+        g_ProgressCurrentTargetInitialSize = 0;
+        g_ProgressCurrentTargetInitialWriteTime = {};
+        g_ProgressCurrentTargetInitiallyExisted = false;
+    }
+
+    // The Explorer progress window is only an explicit compatibility option.
+    // The default UI intentionally follows Far's own copy-progress layout.
+    if (showSystemProgressUi || !g_Info.AdvControl || !g_Info.DialogInit ||
+        !g_Info.DialogRun || !g_Info.DialogFree || !g_Info.SendDlgMessage ||
+        !g_Info.DefDlgProc)
+    {
+        DebugLog(
+            L"BeginNativeProgress native dialog unavailable: systemUi=%d AdvControl=%d DialogInit=%d DialogRun=%d DialogFree=%d SendDlgMessage=%d DefDlgProc=%d",
+            showSystemProgressUi ? 1 : 0,
+            g_Info.AdvControl ? 1 : 0,
+            g_Info.DialogInit ? 1 : 0,
+            g_Info.DialogRun ? 1 : 0,
+            g_Info.DialogFree ? 1 : 0,
+            g_Info.SendDlgMessage ? 1 : 0,
+            g_Info.DefDlgProc ? 1 : 0);
+        g_NativeProgressActive.store(false);
+        g_ProgressDialog = nullptr;
+        return;
+    }
+
+    constexpr intptr_t dialogWidth = 76;
+    const intptr_t totalSeparatorY = showTotal ? 5 : 4;
+    const intptr_t totalBarY = showTotal ? 6 : 4;
+    const intptr_t separatorY = showTotal ? 7 : 5;
+    const intptr_t buttonY = showTotal ? 8 : 6;
+    const intptr_t boxBottom = showTotal ? 9 : 7;
+
+    FarDialogItem items[ProgressCount]{};
+
+    items[ProgressBox].Type = DI_DOUBLEBOX;
+    items[ProgressBox].X1 = 3;
+    items[ProgressBox].Y1 = 1;
+    items[ProgressBox].X2 = dialogWidth - 4;
+    items[ProgressBox].Y2 = boxBottom;
+    items[ProgressBox].Flags = DIF_NONE;
+    items[ProgressBox].Data = move ? Msg(MProgressMove) : Msg(MProgressCopy);
+
+    items[ProgressCurrentLabel].Type = DI_TEXT;
+    items[ProgressCurrentLabel].X1 = 5;
+    items[ProgressCurrentLabel].Y1 = 2;
+    items[ProgressCurrentLabel].X2 = dialogWidth - 6;
+    items[ProgressCurrentLabel].Y2 = 2;
+    items[ProgressCurrentLabel].Flags = DIF_NOFOCUS;
+    items[ProgressCurrentLabel].Data = move ? Msg(MProgressCurrentMove) : Msg(MProgressCurrentCopy);
+
+    items[ProgressDetail].Type = DI_TEXT;
+    items[ProgressDetail].X1 = 5;
+    items[ProgressDetail].Y1 = 3;
+    items[ProgressDetail].X2 = dialogWidth - 6;
+    items[ProgressDetail].Y2 = 3;
+    items[ProgressDetail].Flags = DIF_NOFOCUS | DIF_SHOWAMPERSAND;
+    items[ProgressDetail].Data = Msg(MProgressPreparing);
+
+    items[ProgressCurrentBar].Type = DI_TEXT;
+    items[ProgressCurrentBar].X1 = 5;
+    items[ProgressCurrentBar].Y1 = 4;
+    items[ProgressCurrentBar].X2 = dialogWidth - 6;
+    items[ProgressCurrentBar].Y2 = 4;
+    items[ProgressCurrentBar].Flags = DIF_NOFOCUS;
+    g_ProgressCurrentBarText = MakeProgressBar(0);
+    items[ProgressCurrentBar].Data = g_ProgressCurrentBarText.c_str();
+
+    items[ProgressTotalSeparator].Type = DI_TEXT;
+    items[ProgressTotalSeparator].X1 = -1;
+    items[ProgressTotalSeparator].Y1 = totalSeparatorY;
+    items[ProgressTotalSeparator].X2 = dialogWidth - 6;
+    items[ProgressTotalSeparator].Y2 = totalSeparatorY;
+    items[ProgressTotalSeparator].Flags = DIF_SEPARATOR | DIF_NOFOCUS |
+        (showTotal ? DIF_NONE : DIF_HIDDEN);
+    items[ProgressTotalSeparator].Data = showTotal ? Msg(MProgressTotal) : L"";
+
+    items[ProgressTotalBar].Type = DI_TEXT;
+    items[ProgressTotalBar].X1 = 5;
+    items[ProgressTotalBar].Y1 = totalBarY;
+    items[ProgressTotalBar].X2 = dialogWidth - 6;
+    items[ProgressTotalBar].Y2 = totalBarY;
+    items[ProgressTotalBar].Flags = DIF_NOFOCUS | (showTotal ? DIF_NONE : DIF_HIDDEN);
+    g_ProgressOverallBarText = MakeProgressBar(0);
+    items[ProgressTotalBar].Data = showTotal ? g_ProgressOverallBarText.c_str() : L"";
+
+    items[ProgressSeparator].Type = DI_TEXT;
+    items[ProgressSeparator].X1 = -1;
+    items[ProgressSeparator].Y1 = separatorY;
+    items[ProgressSeparator].X2 = dialogWidth - 6;
+    items[ProgressSeparator].Y2 = separatorY;
+    items[ProgressSeparator].Flags = DIF_SEPARATOR | DIF_NOFOCUS;
+    items[ProgressSeparator].Data = L"";
+
+    items[ProgressCancel].Type = DI_BUTTON;
+    items[ProgressCancel].X1 = 0;
+    items[ProgressCancel].Y1 = buttonY;
+    items[ProgressCancel].X2 = 0;
+    items[ProgressCancel].Y2 = buttonY;
+    items[ProgressCancel].Flags =
+        DIF_CENTERGROUP | DIF_FOCUS | DIF_DEFAULTBUTTON | DIF_BTNNOCLOSE;
+    items[ProgressCancel].Data = Msg(MProgressCancel);
+
+    HANDLE dialog = g_Info.DialogInit(
+        &PluginGuid,
+        &ProgressDialogGuid,
+        -1,
+        -1,
+        dialogWidth,
+        boxBottom + 2,
+        nullptr,
+        items,
+        ProgressCount,
+        0,
+        // This MUST be a modal Far dialog.  The actual file operation runs
+        // on the worker thread, while Far's dialog loop stays on the main
+        // thread and owns keyboard / mouse input.  A non-modal dialog only
+        // painted the progress UI over the panels: Enter / Esc / mouse still
+        // went to the panel underneath and could even be replayed after the
+        // copy finished.
+        FDLG_KEEPCONSOLETITLE,
+        ProgressDialogProc,
+        nullptr);
+
+    DebugLog(
+        L"DialogInit returned dialog=%p width=%lld height=%lld showTotal=%d",
+        dialog,
+        static_cast<long long>(dialogWidth),
+        static_cast<long long>(boxBottom + 2),
+        showTotal ? 1 : 0);
+
+    if (!dialog || dialog == INVALID_HANDLE_VALUE)
+    {
+        DebugLog(L"DialogInit FAILED dialog=%p lastError=%lu", dialog, static_cast<unsigned long>(GetLastError()));
+        g_ProgressDialog = nullptr;
+        g_NativeProgressActive.store(false);
+        return;
+    }
+
+    g_ProgressDialog = dialog;
+    g_NativeProgressActive.store(true);
+}
+
+void RunNativeProgressDialog()
+{
+    HANDLE dialog = g_ProgressDialog;
+    if (!g_NativeProgressActive.load() || !dialog || dialog == INVALID_HANDLE_VALUE ||
+        !g_Info.DialogRun || !g_Info.DialogFree)
+    {
+        DebugLog(
+            L"RunNativeProgressDialog skipped active=%d dialog=%p DialogRun=%d DialogFree=%d",
+            g_NativeProgressActive.load() ? 1 : 0,
+            dialog,
+            g_Info.DialogRun ? 1 : 0,
+            g_Info.DialogFree ? 1 : 0);
+        return;
+    }
+
+    g_ProgressDialogRunning.store(true);
+    DebugLog(L"DialogRun ENTER dialog=%p", dialog);
+    const intptr_t runResult = g_Info.DialogRun(dialog);
+    DebugLog(
+        L"DialogRun EXIT dialog=%p result=%lld cancelRequested=%d closing=%d",
+        dialog,
+        static_cast<long long>(runResult),
+        g_ProgressCancelRequested.load() ? 1 : 0,
+        g_ProgressDialogClosing.load() ? 1 : 0);
+    g_ProgressDialogRunning.store(false);
+    g_ProgressDialogClosing.store(false);
+
+    // Modal dialogs are owned by the plugin and must be freed explicitly.
+    // EndNativeProgress() may already have cleared the global handle while
+    // closing us from ProcessSynchroEventW, therefore keep and free the local
+    // handle exactly once here.
+    if (g_ProgressDialog == dialog)
+        g_ProgressDialog = nullptr;
+    DebugLog(L"DialogFree dialog=%p", dialog);
+    g_Info.DialogFree(dialog);
+}
+
+void EndNativeProgress()
+{
+    DebugLog(
+        L"EndNativeProgress ENTER active=%d dialog=%p running=%d cancelRequested=%d",
+        g_NativeProgressActive.load() ? 1 : 0,
+        g_ProgressDialog,
+        g_ProgressDialogRunning.load() ? 1 : 0,
+        g_ProgressCancelRequested.load() ? 1 : 0);
+    g_NativeProgressActive.store(false);
+    g_ProgressSyncQueued.store(false);
+    g_ProgressForceRedrawPending.store(false);
+
+    HANDLE dialog = g_ProgressDialog;
+    if (dialog && dialog != INVALID_HANDLE_VALUE)
+    {
+        if (g_ProgressDialogRunning.load() && g_Info.SendDlgMessage)
+        {
+            g_ProgressDialogClosing.store(true);
+            const intptr_t closeResult = g_Info.SendDlgMessage(dialog, DM_CLOSE, -1, nullptr);
+            DebugLog(
+                L"EndNativeProgress DM_CLOSE dialog=%p result=%lld",
+                dialog,
+                static_cast<long long>(closeResult));
+        }
+        else if (g_Info.DialogFree)
+        {
+            // DialogInit succeeded but the worker thread could not be
+            // started, so DialogRun was never entered.  Free it here.
+            g_Info.DialogFree(dialog);
+            g_ProgressDialogClosing.store(false);
+            DebugLog(L"EndNativeProgress freed dialog without DialogRun dialog=%p", dialog);
+        }
+    }
+
+    g_ProgressDialog = nullptr;
+    g_ProgressDialogRunning.store(false);
+    g_ProgressCancelRequested.store(false);
+    g_ProgressCancelPromptActive.store(false);
+    g_ProgressCancelPromptCv.notify_all();
+    InterlockedExchange(&g_ProgressWin32CancelFlag, FALSE);
+    g_ProgressShowTotal.store(false);
+    g_ProgressCurrentTotalBytes.store(0);
+    g_ProgressCurrentDoneBytes.store(0);
+    g_ProgressOverallTotalBytes.store(0);
+    g_ProgressOverallDoneBytes.store(0);
+    DebugLog(L"EndNativeProgress EXIT");
+}
+
+void EnsureProgressRedrawQueued(bool force)
+{
+    if (!g_NativeProgressActive.load() || !g_Info.AdvControl)
+        return;
+
+    const unsigned long long now = GetTickCount64();
+    const unsigned long long last = g_ProgressLastSyncTick.load();
+    if (!force && last != 0 && now - last < ProgressRedrawIntervalMs)
+        return;
+
+    bool expected = false;
+    if (!g_ProgressSyncQueued.compare_exchange_strong(expected, true))
+        return;
+
+    g_ProgressLastSyncTick.store(now);
+
+    // ACTL_SYNCHRO is unusual: by Far API contract it returns 0 on success.
+    // The old code treated 0 as failure and immediately cleared
+    // g_ProgressSyncQueued, so *every* CopyFileEx progress callback queued a
+    // new main-thread synchro event.  Since Far services ACTL_SYNCHRO from its
+    // GetInputRecord path, that flood could starve keyboard and mouse input,
+    // especially while recursively copying a directory.
+    g_Info.AdvControl(&PluginGuid, ACTL_SYNCHRO, 0, &g_ProgressSyncToken);
+}
+
+void QueueProgressRedraw(bool force = false)
+{
+    g_ProgressRedrawGeneration.fetch_add(1, std::memory_order_relaxed);
+    if (force)
+        g_ProgressForceRedrawPending.store(true, std::memory_order_release);
+    EnsureProgressRedrawQueued(force);
+}
+
+void QueueProgressUpdate(unsigned int total, unsigned int done, IShellItem* item = nullptr)
+{
+    if (!g_NativeProgressActive.load())
+        return;
+
+    g_ProgressTotal.store(total);
+    g_ProgressDone.store(done);
+
+    if (item)
+    {
+        PWSTR displayName = nullptr;
+        if (SUCCEEDED(item->GetDisplayName(SIGDN_NORMALDISPLAY, &displayName)) && displayName)
+        {
+            std::lock_guard<std::mutex> lock(g_ProgressNameMutex);
+            g_ProgressName = displayName;
+            CoTaskMemFree(displayName);
+        }
+    }
+
+    QueueProgressRedraw();
+}
+
+void UpdateNativeProgress()
+{
+    // Keep the queued flag set for the *whole* main-thread redraw.  Clearing it
+    // at entry lets the worker queue another ACTL_SYNCHRO while this one is
+    // still executing and recreates the input-starvation loop.
+    const unsigned long long renderedGeneration =
+        g_ProgressRedrawGeneration.load(std::memory_order_acquire);
+    g_ProgressForceRedrawPending.store(false, std::memory_order_release);
+
+    if (!g_NativeProgressActive.load() || !g_ProgressDialog ||
+        g_ProgressDialog == INVALID_HANDLE_VALUE || !g_Info.SendDlgMessage)
+    {
+        g_ProgressSyncQueued.store(false, std::memory_order_release);
+        return;
+    }
+
+    const unsigned int total = g_ProgressTotal.load();
+    const unsigned int done = g_ProgressDone.load();
+    const unsigned long long overallBytesTotal = g_ProgressOverallTotalBytes.load();
+    const unsigned long long overallBytesDone = g_ProgressOverallDoneBytes.load();
+    const unsigned int overallPercent = overallBytesTotal
+        ? static_cast<unsigned int>(std::min<unsigned long long>(
+              100ULL, (100ULL * overallBytesDone) / overallBytesTotal))
+        : (total
+            ? static_cast<unsigned int>(std::min<unsigned long long>(100ULL, (100ULL * done) / total))
+            : 0);
+
+    const unsigned long long currentTotal = g_ProgressCurrentTotalBytes.load();
+    const unsigned long long currentDone = g_ProgressCurrentDoneBytes.load();
+    const unsigned int currentPercent = currentTotal
+        ? static_cast<unsigned int>(std::min<unsigned long long>(100ULL, (100ULL * currentDone) / currentTotal))
+        : overallPercent;
+
+    g_ProgressCurrentBarText = MakeProgressBar(currentPercent);
+    g_ProgressOverallBarText = MakeProgressBar(overallPercent);
+
+    if (g_ProgressCancelRequested.load())
+    {
+        g_ProgressDetailText = Msg(MProgressCancelling);
+    }
+    else
+    {
+        std::lock_guard<std::mutex> lock(g_ProgressNameMutex);
+        g_ProgressDetailText = g_ProgressName.empty()
+            ? std::wstring(Msg(MProgressPreparing))
+            : g_ProgressName;
+    }
+
+    if (g_ProgressDetailText.size() > 66)
+        g_ProgressDetailText = L"..." + g_ProgressDetailText.substr(g_ProgressDetailText.size() - 63);
+
+    g_Info.SendDlgMessage(
+        g_ProgressDialog,
+        DM_SETTEXTPTR,
+        ProgressDetail,
+        const_cast<wchar_t*>(g_ProgressDetailText.c_str()));
+    g_Info.SendDlgMessage(
+        g_ProgressDialog,
+        DM_SETTEXTPTR,
+        ProgressCurrentBar,
+        const_cast<wchar_t*>(g_ProgressCurrentBarText.c_str()));
+
+    if (g_ProgressShowTotal.load())
+    {
+        g_Info.SendDlgMessage(
+            g_ProgressDialog,
+            DM_SETTEXTPTR,
+            ProgressTotalBar,
+            const_cast<wchar_t*>(g_ProgressOverallBarText.c_str()));
+    }
+
+    g_Info.SendDlgMessage(g_ProgressDialog, DM_REDRAW, 0, nullptr);
+
+    // Let Far return to its input loop before another ordinary progress update.
+    // If progress changed while we were painting, a follow-up is allowed, but
+    // ordinary redraws remain capped at ~20 Hz.  A forced final redraw may skip
+    // the cap, yet there is still never more than one ACTL_SYNCHRO outstanding.
+    g_ProgressSyncQueued.store(false, std::memory_order_release);
+    if (g_NativeProgressActive.load() &&
+        g_ProgressRedrawGeneration.load(std::memory_order_acquire) != renderedGeneration)
+    {
+        const bool force = g_ProgressForceRedrawPending.load(std::memory_order_acquire);
+        EnsureProgressRedrawQueued(force);
+    }
+}
+
+// IFileOperation does not expose a separate Cancel() method.  Its callbacks
+// remain useful for Shell-only fallback paths, but they are not relied on for
+// guaranteed mid-file cancellation: ordinary filesystem copies use the
+// CopyFileEx / MoveFileWithProgress engine below.  This invisible progress
+// object merely gives the Shell fallback another chance to observe a pending
+// cancellation request between work items.
+class FarOperationsProgressDialog final : public IOperationsProgressDialog
+{
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override
+    {
+        if (!object)
+            return E_POINTER;
+
+        *object = nullptr;
+        if (riid == IID_IUnknown || riid == IID_IOperationsProgressDialog)
+        {
+            *object = static_cast<IOperationsProgressDialog*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override
+    {
+        return static_cast<ULONG>(InterlockedIncrement(&refs_));
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        const LONG refs = InterlockedDecrement(&refs_);
+        if (!refs)
+            delete this;
+        return static_cast<ULONG>(refs);
+    }
+
+    HRESULT STDMETHODCALLTYPE StartProgressDialog(HWND, OPPROGDLGF) override
+    {
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE StopProgressDialog() override
+    {
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE SetOperation(SPACTION) override
+    {
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE SetMode(PDMODE) override
+    {
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE UpdateProgress(
+        ULONGLONG,
+        ULONGLONG,
+        ULONGLONG,
+        ULONGLONG,
+        ULONGLONG,
+        ULONGLONG) override
+    {
+        WaitWhileProgressCancelPromptActive();
+        return g_ProgressCancelRequested.load() ? E_ABORT : S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE UpdateLocations(IShellItem*, IShellItem*, IShellItem*) override
+    {
+        WaitWhileProgressCancelPromptActive();
+        return g_ProgressCancelRequested.load() ? E_ABORT : S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE ResetTimer() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE PauseTimer() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE ResumeTimer() override { return S_OK; }
+
+    HRESULT STDMETHODCALLTYPE GetMilliseconds(ULONGLONG* elapsed, ULONGLONG* remaining) override
+    {
+        if (!elapsed || !remaining)
+            return E_POINTER;
+
+        *elapsed = 0;
+        *remaining = 0;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetOperationStatus(PDOPSTATUS* status) override
+    {
+        if (!status)
+            return E_POINTER;
+
+        // STOPPED means "terminate completely" rather than merely pausing the
+        // progress surface.  This is what Far's Cancel button promises here.
+        *status = g_ProgressCancelRequested.load() ? PDOPS_STOPPED : PDOPS_RUNNING;
+        return S_OK;
+    }
+
+private:
+    volatile LONG refs_ = 1;
+};
+
+class FileOperationProgressSink final : public IFileOperationProgressSink
+{
+public:
+    FileOperationProgressSink() = default;
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override
+    {
+        if (!object)
+            return E_POINTER;
+        *object = nullptr;
+        if (riid == IID_IUnknown || riid == IID_IFileOperationProgressSink)
+        {
+            *object = static_cast<IFileOperationProgressSink*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override
+    {
+        return static_cast<ULONG>(InterlockedIncrement(&refs_));
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        const LONG refs = InterlockedDecrement(&refs_);
+        if (!refs)
+            delete this;
+        return static_cast<ULONG>(refs);
+    }
+
+    HRESULT STDMETHODCALLTYPE StartOperations() override
+    {
+        QueueProgressUpdate(0, 0);
+        return CheckCancelled();
+    }
+
+    HRESULT STDMETHODCALLTYPE FinishOperations(HRESULT) override
+    {
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE PreRenameItem(DWORD, IShellItem* item, LPCWSTR) override
+    {
+        QueueProgressUpdate(g_ProgressTotal.load(), g_ProgressDone.load(), item);
+        return CheckCancelled();
+    }
+
+    HRESULT STDMETHODCALLTYPE PostRenameItem(DWORD, IShellItem*, LPCWSTR, HRESULT, IShellItem*) override
+    {
+        return CheckCancelled();
+    }
+
+    HRESULT STDMETHODCALLTYPE PreMoveItem(
+        DWORD,
+        IShellItem* item,
+        IShellItem* destinationFolder,
+        LPCWSTR newName) override
+    {
+        SetCurrentProgressItem(item, destinationFolder, newName);
+        QueueProgressUpdate(g_ProgressTotal.load(), g_ProgressDone.load());
+        return CheckCancelled();
+    }
+
+    HRESULT STDMETHODCALLTYPE PostMoveItem(DWORD, IShellItem*, IShellItem*, LPCWSTR, HRESULT, IShellItem*) override
+    {
+        CompleteCurrentProgressItem();
+        QueueProgressUpdate(g_ProgressTotal.load(), g_ProgressDone.load());
+        return CheckCancelled();
+    }
+
+    HRESULT STDMETHODCALLTYPE PreCopyItem(
+        DWORD,
+        IShellItem* item,
+        IShellItem* destinationFolder,
+        LPCWSTR newName) override
+    {
+        SetCurrentProgressItem(item, destinationFolder, newName);
+        QueueProgressUpdate(g_ProgressTotal.load(), g_ProgressDone.load());
+        return CheckCancelled();
+    }
+
+    HRESULT STDMETHODCALLTYPE PostCopyItem(DWORD, IShellItem*, IShellItem*, LPCWSTR, HRESULT, IShellItem*) override
+    {
+        CompleteCurrentProgressItem();
+        QueueProgressUpdate(g_ProgressTotal.load(), g_ProgressDone.load());
+        return CheckCancelled();
+    }
+
+    HRESULT STDMETHODCALLTYPE PreDeleteItem(DWORD, IShellItem* item) override
+    {
+        QueueProgressUpdate(g_ProgressTotal.load(), g_ProgressDone.load(), item);
+        return CheckCancelled();
+    }
+
+    HRESULT STDMETHODCALLTYPE PostDeleteItem(DWORD, IShellItem*, HRESULT, IShellItem*) override
+    {
+        return CheckCancelled();
+    }
+
+    HRESULT STDMETHODCALLTYPE PreNewItem(DWORD, IShellItem* item, LPCWSTR) override
+    {
+        QueueProgressUpdate(g_ProgressTotal.load(), g_ProgressDone.load(), item);
+        return CheckCancelled();
+    }
+
+    HRESULT STDMETHODCALLTYPE PostNewItem(DWORD, IShellItem*, LPCWSTR, LPCWSTR, DWORD, HRESULT, IShellItem*) override
+    {
+        return CheckCancelled();
+    }
+
+    HRESULT STDMETHODCALLTYPE UpdateProgress(UINT total, UINT done) override
+    {
+        RefreshCurrentProgressFromTarget();
+        QueueProgressUpdate(total, done);
+        return CheckCancelled();
+    }
+
+    HRESULT STDMETHODCALLTYPE ResetTimer() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE PauseTimer() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE ResumeTimer() override { return S_OK; }
+
+private:
+    HRESULT CheckCancelled() const
+    {
+        WaitWhileProgressCancelPromptActive();
+        return g_ProgressCancelRequested.load() ? E_ABORT : S_OK;
+    }
+
+    volatile LONG refs_ = 1;
+};
+
+// IFileOperation has no public Cancel() method.  Its progress sink can abort
+// between Shell work items, but on some Windows builds that does not stop an
+// already-running large CopyItem.  For normal filesystem clipboard paths we
+// therefore use the Win32 copy/move APIs that *explicitly* support mid-file
+// cancellation.  IFileOperation remains the fallback for virtual Shell items,
+// reparse points and the optional Windows conflict/progress UI.
+
+struct NativeTransferState
+{
+    unsigned long long TotalBytes = 0;
+    unsigned long long CompletedBytes = 0;
+};
+
+struct NativeTransferProgressContext
+{
+    NativeTransferState* State = nullptr;
+    unsigned long long OverallBase = 0;
+};
+
+DWORD CALLBACK NativeTransferProgressRoutine(
+    LARGE_INTEGER totalFileSize,
+    LARGE_INTEGER totalBytesTransferred,
+    LARGE_INTEGER,
+    LARGE_INTEGER,
+    DWORD,
+    DWORD,
+    HANDLE,
+    HANDLE,
+    LPVOID data)
+{
+    WaitWhileProgressCancelPromptActive();
+
+    const auto* context = static_cast<const NativeTransferProgressContext*>(data);
+    const unsigned long long total = totalFileSize.QuadPart > 0
+        ? static_cast<unsigned long long>(totalFileSize.QuadPart)
+        : 0ULL;
+    const unsigned long long done = totalBytesTransferred.QuadPart > 0
+        ? static_cast<unsigned long long>(totalBytesTransferred.QuadPart)
+        : 0ULL;
+
+    const unsigned long long currentDone = std::min(done, total);
+    g_ProgressCurrentTotalBytes.store(total);
+    g_ProgressCurrentDoneBytes.store(currentDone);
+    if (context && context->State)
+    {
+        const unsigned long long base = std::min(
+            context->OverallBase, context->State->TotalBytes);
+        const unsigned long long remaining = context->State->TotalBytes - base;
+        const unsigned long long overall = base + std::min(currentDone, remaining);
+        g_ProgressOverallDoneBytes.store(overall);
+    }
+    QueueProgressRedraw();
+
+    const bool cancelRequested = g_ProgressCancelRequested.load();
+    const LONG win32Cancel = InterlockedCompareExchange(
+        &g_ProgressWin32CancelFlag, FALSE, FALSE);
+    if (cancelRequested || win32Cancel != FALSE)
+    {
+        DebugLog(
+            L"NativeTransferProgressRoutine CANCEL total=%llu done=%llu cancelRequested=%d win32Flag=%ld",
+            total,
+            currentDone,
+            cancelRequested ? 1 : 0,
+            static_cast<long>(win32Cancel));
+    }
+
+    return cancelRequested ? PROGRESS_CANCEL : PROGRESS_CONTINUE;
+}
+
+void SetNativeProgressPath(const std::wstring& source, unsigned long long size)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_ProgressNameMutex);
+        g_ProgressName = ProgressBaseName(source);
+        g_ProgressCurrentTargetPath.clear();
+        g_ProgressCurrentTargetInitialSize = 0;
+        g_ProgressCurrentTargetInitialWriteTime = {};
+        g_ProgressCurrentTargetInitiallyExisted = false;
+    }
+
+    g_ProgressCurrentTargetObservedChange.store(true);
+    g_ProgressCurrentTotalBytes.store(size);
+    g_ProgressCurrentDoneBytes.store(0);
+    QueueProgressRedraw();
+}
+
+bool MeasureNativeTransferPath(
+    const std::wstring& path,
+    unsigned long long& totalBytes,
+    DWORD& errorCode,
+    bool& unsupported)
+{
+    WaitWhileProgressCancelPromptActive();
+    if (g_ProgressCancelRequested.load())
+    {
+        errorCode = ERROR_REQUEST_ABORTED;
+        return false;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data))
+    {
+        errorCode = GetLastError();
+        return false;
+    }
+
+    if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+    {
+        unsupported = true;
+        errorCode = ERROR_NOT_SUPPORTED;
+        return false;
+    }
+
+    if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+    {
+        ULARGE_INTEGER size{};
+        size.HighPart = data.nFileSizeHigh;
+        size.LowPart = data.nFileSizeLow;
+        if (ULLONG_MAX - totalBytes < size.QuadPart)
+            totalBytes = ULLONG_MAX;
+        else
+            totalBytes += size.QuadPart;
+        return true;
+    }
+
+    WIN32_FIND_DATAW findData{};
+    const std::wstring mask = JoinProgressPath(path, L"*");
+    HANDLE find = FindFirstFileW(mask.c_str(), &findData);
+    if (find == INVALID_HANDLE_VALUE)
+    {
+        const DWORD findError = GetLastError();
+        // FindFirstFile("dir\\*") reports FILE_NOT_FOUND for an empty
+        // directory.  That is a valid zero-byte tree, not a transfer error.
+        if (findError == ERROR_FILE_NOT_FOUND)
+            return true;
+        errorCode = findError;
+        return false;
+    }
+
+    bool ok = true;
+    do
+    {
+        if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0)
+            continue;
+
+        if (!MeasureNativeTransferPath(
+                JoinProgressPath(path, findData.cFileName), totalBytes, errorCode, unsupported))
+        {
+            ok = false;
+            break;
+        }
+    }
+    while (FindNextFileW(find, &findData));
+
+    if (ok)
+    {
+        const DWORD findError = GetLastError();
+        if (findError != ERROR_NO_MORE_FILES)
+        {
+            errorCode = findError;
+            ok = false;
+        }
+    }
+
+    FindClose(find);
+    return ok;
+}
+
+void CopyDirectoryMetadataBestEffort(const std::wstring& source, const std::wstring& target)
+{
+    const DWORD attrs = GetFileAttributesW(source.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES)
+        SetFileAttributesW(target.c_str(), attrs);
+
+    HANDLE sourceHandle = CreateFileW(
+        source.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (sourceHandle == INVALID_HANDLE_VALUE)
+        return;
+
+    HANDLE targetHandle = CreateFileW(
+        target.c_str(), FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (targetHandle != INVALID_HANDLE_VALUE)
+    {
+        FILETIME created{}, accessed{}, written{};
+        if (GetFileTime(sourceHandle, &created, &accessed, &written))
+            SetFileTime(targetHandle, &created, &accessed, &written);
+        CloseHandle(targetHandle);
+    }
+    CloseHandle(sourceHandle);
+}
+
+bool MakePartialTargetPath(const std::wstring& target, std::wstring& partial)
+{
+    const DWORD processId = GetCurrentProcessId();
+    const DWORD threadId = GetCurrentThreadId();
+    for (unsigned int attempt = 0; attempt < 1000; ++attempt)
+    {
+        wchar_t suffix[96]{};
+        swprintf_s(
+            suffix,
+            L".farfileclipboard-part-%lu-%lu-%u",
+            static_cast<unsigned long>(processId),
+            static_cast<unsigned long>(threadId),
+            attempt);
+        const std::wstring candidate = target + suffix;
+
+        HANDLE file = CreateFileW(
+            candidate.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+            FILE_ATTRIBUTE_TEMPORARY, nullptr);
+        if (file != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(file);
+            partial = candidate;
+            return true;
+        }
+
+        const DWORD createError = GetLastError();
+        if (createError != ERROR_FILE_EXISTS && createError != ERROR_ALREADY_EXISTS)
+            return false;
+    }
+
+    SetLastError(ERROR_FILE_EXISTS);
+    return false;
+}
+
+bool TransferNativePath(
+    bool move,
+    const std::wstring& source,
+    const std::wstring& target,
+    NativeTransferState& progress,
+    DWORD& errorCode,
+    bool& aborted,
+    bool& unsupported)
+{
+    WaitWhileProgressCancelPromptActive();
+    DebugLog(
+        L"TransferNativePath ENTER move=%d source='%ls' target='%ls' cancelRequested=%d win32Flag=%ld",
+        move ? 1 : 0,
+        source.c_str(),
+        target.c_str(),
+        g_ProgressCancelRequested.load() ? 1 : 0,
+        static_cast<long>(InterlockedCompareExchange(&g_ProgressWin32CancelFlag, FALSE, FALSE)));
+
+    if (g_ProgressCancelRequested.load())
+    {
+        DebugLog(L"TransferNativePath abort before start: cancel already requested");
+        aborted = true;
+        errorCode = ERROR_REQUEST_ABORTED;
+        return false;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA sourceData{};
+    if (!GetFileAttributesExW(source.c_str(), GetFileExInfoStandard, &sourceData))
+    {
+        errorCode = GetLastError();
+        return false;
+    }
+
+    if ((sourceData.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+    {
+        unsupported = true;
+        errorCode = ERROR_NOT_SUPPORTED;
+        return false;
+    }
+
+    const bool sourceDirectory =
+        (sourceData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+    ULARGE_INTEGER sourceSizeValue{};
+    sourceSizeValue.HighPart = sourceData.nFileSizeHigh;
+    sourceSizeValue.LowPart = sourceData.nFileSizeLow;
+    const unsigned long long sourceSize = sourceDirectory ? 0ULL : sourceSizeValue.QuadPart;
+
+    if (!sourceDirectory)
+    {
+        const DWORD targetAttrs = GetFileAttributesW(target.c_str());
+        if (targetAttrs != INVALID_FILE_ATTRIBUTES &&
+            (targetAttrs & FILE_ATTRIBUTE_DIRECTORY) != 0)
+        {
+            errorCode = ERROR_ALREADY_EXISTS;
+            return false;
+        }
+
+        SetNativeProgressPath(source, sourceSize);
+        const unsigned long long base = progress.CompletedBytes;
+        NativeTransferProgressContext context{ &progress, base };
+
+        BOOL ok = FALSE;
+        const bool replacingExisting = targetAttrs != INVALID_FILE_ATTRIBUTES;
+        std::wstring transferTarget = target;
+        if (replacingExisting)
+        {
+            // Copy through a sibling temporary file.  CopyFileEx documents
+            // that PROGRESS_CANCEL deletes the partial destination; writing
+            // directly over an existing destination would therefore risk
+            // destroying the old file just because the user pressed Cancel.
+            if (!MakePartialTargetPath(target, transferTarget))
+            {
+                errorCode = GetLastError();
+                return false;
+            }
+        }
+
+        if (move && !replacingExisting)
+        {
+            DebugLog(
+                L"MoveFileWithProgressW START source='%ls' target='%ls' size=%llu",
+                source.c_str(), transferTarget.c_str(), sourceSize);
+            ok = MoveFileWithProgressW(
+                source.c_str(), transferTarget.c_str(),
+                NativeTransferProgressRoutine, &context,
+                MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+            const DWORD moveError = ok ? ERROR_SUCCESS : GetLastError();
+            DebugLog(
+                L"MoveFileWithProgressW END ok=%d error=%lu cancelRequested=%d win32Flag=%ld",
+                ok ? 1 : 0,
+                static_cast<unsigned long>(moveError),
+                g_ProgressCancelRequested.load() ? 1 : 0,
+                static_cast<long>(InterlockedCompareExchange(&g_ProgressWin32CancelFlag, FALSE, FALSE)));
+            if (!ok)
+                SetLastError(moveError);
+        }
+        else
+        {
+            DebugLog(
+                L"CopyFileExW START source='%ls' target='%ls' size=%llu replacing=%d",
+                source.c_str(), transferTarget.c_str(), sourceSize, replacingExisting ? 1 : 0);
+            ok = CopyFileExW(
+                source.c_str(), transferTarget.c_str(),
+                NativeTransferProgressRoutine, &context,
+                reinterpret_cast<LPBOOL>(const_cast<LONG*>(&g_ProgressWin32CancelFlag)), 0);
+            const DWORD copyError = ok ? ERROR_SUCCESS : GetLastError();
+            DebugLog(
+                L"CopyFileExW END ok=%d error=%lu cancelRequested=%d win32Flag=%ld",
+                ok ? 1 : 0,
+                static_cast<unsigned long>(copyError),
+                g_ProgressCancelRequested.load() ? 1 : 0,
+                static_cast<long>(InterlockedCompareExchange(&g_ProgressWin32CancelFlag, FALSE, FALSE)));
+            if (!ok)
+                SetLastError(copyError);
+        }
+
+        if (!ok)
+        {
+            errorCode = GetLastError();
+            DebugLog(
+                L"TransferNativePath transfer failed error=%lu replacing=%d cancelRequested=%d",
+                static_cast<unsigned long>(errorCode),
+                replacingExisting ? 1 : 0,
+                g_ProgressCancelRequested.load() ? 1 : 0);
+            if (replacingExisting)
+                DeleteFileW(transferTarget.c_str());
+            if (errorCode == ERROR_REQUEST_ABORTED || g_ProgressCancelRequested.load())
+            {
+                aborted = true;
+                errorCode = ERROR_REQUEST_ABORTED;
+            }
+            return false;
+        }
+
+        if (replacingExisting)
+        {
+            if (g_ProgressCancelRequested.load())
+            {
+                DeleteFileW(transferTarget.c_str());
+                aborted = true;
+                errorCode = ERROR_REQUEST_ABORTED;
+                return false;
+            }
+
+            if (!MoveFileExW(
+                    transferTarget.c_str(), target.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            {
+                errorCode = GetLastError();
+                DeleteFileW(transferTarget.c_str());
+                return false;
+            }
+
+            if (move && !DeleteFileW(source.c_str()))
+            {
+                errorCode = GetLastError();
+                return false;
+            }
+        }
+
+        const unsigned long long remaining = progress.TotalBytes - std::min(base, progress.TotalBytes);
+        progress.CompletedBytes = std::min(base, progress.TotalBytes) +
+            std::min(sourceSize, remaining);
+        g_ProgressCurrentTotalBytes.store(sourceSize);
+        g_ProgressCurrentDoneBytes.store(sourceSize);
+        g_ProgressOverallDoneBytes.store(progress.CompletedBytes);
+        QueueProgressRedraw();
+        DebugLog(
+            L"TransferNativePath SUCCESS source='%ls' completedBytes=%llu totalBytes=%llu",
+            source.c_str(), progress.CompletedBytes, progress.TotalBytes);
+        return true;
+    }
+
+    const DWORD targetAttrs = GetFileAttributesW(target.c_str());
+    const bool targetExists = targetAttrs != INVALID_FILE_ATTRIBUTES;
+    if (targetExists && (targetAttrs & FILE_ATTRIBUTE_DIRECTORY) == 0)
+    {
+        errorCode = ERROR_ALREADY_EXISTS;
+        return false;
+    }
+
+    // A non-colliding directory move on the same volume is just a rename and
+    // should stay fast.  Cross-volume directory moves are not supported by
+    // MoveFileWithProgress, so fall through to the recursive cancellable path.
+    if (move && !targetExists)
+    {
+        unsigned long long subtreeBytes = 0;
+        DWORD measureError = ERROR_SUCCESS;
+        bool measureUnsupported = false;
+        if (!MeasureNativeTransferPath(source, subtreeBytes, measureError, measureUnsupported))
+        {
+            if (measureUnsupported)
+                unsupported = true;
+            if (measureError == ERROR_REQUEST_ABORTED)
+                aborted = true;
+            errorCode = measureError;
+            return false;
+        }
+
+        SetNativeProgressPath(source, subtreeBytes);
+        const unsigned long long base = progress.CompletedBytes;
+        NativeTransferProgressContext context{ &progress, base };
+        if (MoveFileWithProgressW(
+                source.c_str(), target.c_str(),
+                NativeTransferProgressRoutine, &context,
+                MOVEFILE_WRITE_THROUGH))
+        {
+            const unsigned long long remaining = progress.TotalBytes - std::min(base, progress.TotalBytes);
+            progress.CompletedBytes = std::min(base, progress.TotalBytes) +
+                std::min(subtreeBytes, remaining);
+            g_ProgressCurrentTotalBytes.store(subtreeBytes);
+            g_ProgressCurrentDoneBytes.store(subtreeBytes);
+            g_ProgressOverallDoneBytes.store(progress.CompletedBytes);
+            QueueProgressRedraw();
+            return true;
+        }
+
+        const DWORD moveError = GetLastError();
+        if (moveError == ERROR_REQUEST_ABORTED || g_ProgressCancelRequested.load())
+        {
+            aborted = true;
+            errorCode = ERROR_REQUEST_ABORTED;
+            return false;
+        }
+        if (moveError != ERROR_NOT_SAME_DEVICE)
+        {
+            errorCode = moveError;
+            return false;
+        }
+    }
+
+    bool createdTarget = false;
+    if (!targetExists)
+    {
+        if (!CreateDirectoryW(target.c_str(), nullptr))
+        {
+            const DWORD createError = GetLastError();
+            if (createError != ERROR_ALREADY_EXISTS)
+            {
+                errorCode = createError;
+                return false;
+            }
+        }
+        else
+        {
+            createdTarget = true;
+        }
+    }
+
+    WIN32_FIND_DATAW findData{};
+    const std::wstring mask = JoinProgressPath(source, L"*");
+    HANDLE find = FindFirstFileW(mask.c_str(), &findData);
+    bool ok = true;
+    if (find == INVALID_HANDLE_VALUE)
+    {
+        const DWORD findError = GetLastError();
+        if (findError != ERROR_FILE_NOT_FOUND)
+        {
+            errorCode = findError;
+            return false;
+        }
+    }
+    else
+    {
+        do
+        {
+            if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0)
+                continue;
+
+            if (g_ProgressCancelRequested.load())
+            {
+                aborted = true;
+                errorCode = ERROR_REQUEST_ABORTED;
+                ok = false;
+                break;
+            }
+
+            const std::wstring childSource = JoinProgressPath(source, findData.cFileName);
+            const std::wstring childTarget = JoinProgressPath(target, findData.cFileName);
+            if (!TransferNativePath(
+                    move, childSource, childTarget, progress,
+                    errorCode, aborted, unsupported))
+            {
+                ok = false;
+                break;
+            }
+        }
+        while (FindNextFileW(find, &findData));
+
+        if (ok)
+        {
+            const DWORD findError = GetLastError();
+            if (findError != ERROR_NO_MORE_FILES)
+            {
+                errorCode = findError;
+                ok = false;
+            }
+        }
+        FindClose(find);
+    }
+
+    if (!ok)
+        return false;
+
+    if (createdTarget)
+        CopyDirectoryMetadataBestEffort(source, target);
+
+    if (move)
+    {
+        if (g_ProgressCancelRequested.load())
+        {
+            aborted = true;
+            errorCode = ERROR_REQUEST_ABORTED;
+            return false;
+        }
+
+        if (!RemoveDirectoryW(source.c_str()))
+        {
+            errorCode = GetLastError();
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool RunCancellableFileSystemOperation(
+    UINT function,
+    const std::vector<std::wstring>& fromPaths,
+    const std::vector<std::wstring>& toPaths,
+    FILEOP_FLAGS flags,
+    int& errorCode,
+    bool& aborted,
+    bool& unsupported)
+{
+    errorCode = 0;
+    aborted = false;
+    unsupported = false;
+
+    if (fromPaths.empty() || toPaths.empty())
+    {
+        errorCode = ERROR_INVALID_PARAMETER;
+        return false;
+    }
+
+    unsigned long long totalBytes = 0;
+    DWORD scanError = ERROR_SUCCESS;
+    for (const auto& source : fromPaths)
+    {
+        if (!MeasureNativeTransferPath(source, totalBytes, scanError, unsupported))
+        {
+            if (scanError == ERROR_REQUEST_ABORTED)
+                aborted = true;
+            errorCode = static_cast<int>(scanError);
+            return false;
+        }
+    }
+
+    NativeTransferState progress{};
+    progress.TotalBytes = totalBytes;
+    progress.CompletedBytes = 0;
+
+    g_ProgressOverallTotalBytes.store(progress.TotalBytes);
+    g_ProgressOverallDoneBytes.store(progress.CompletedBytes);
+    QueueProgressRedraw();
+
+    const bool multiDestination = (flags & FOF_MULTIDESTFILES) != 0;
+    const bool move = function == FO_MOVE;
+
+    for (size_t i = 0; i < fromPaths.size(); ++i)
+    {
+        if (g_ProgressCancelRequested.load())
+        {
+            aborted = true;
+            errorCode = ERROR_REQUEST_ABORTED;
+            return false;
+        }
+
+        std::wstring target;
+        if (multiDestination)
+        {
+            if (i >= toPaths.size())
+            {
+                errorCode = ERROR_INVALID_PARAMETER;
+                return false;
+            }
+            target = toPaths[i];
+        }
+        else
+        {
+            target = JoinProgressPath(toPaths.front(), ProgressBaseName(fromPaths[i]));
+        }
+
+        DWORD transferError = ERROR_SUCCESS;
+        if (!TransferNativePath(
+                move, fromPaths[i], target, progress,
+                transferError, aborted, unsupported))
+        {
+            errorCode = static_cast<int>(transferError);
+            return false;
+        }
+    }
+
+    progress.CompletedBytes = progress.TotalBytes;
+    g_ProgressOverallDoneBytes.store(progress.CompletedBytes);
+    QueueProgressRedraw(true);
+    return true;
 }
 
 bool IsPanelsWindow()
@@ -828,6 +2885,257 @@ bool ReadShellClipboard(ShellClipboardData& out)
     return true;
 }
 
+bool ProgressPathNeedsOverallBar(const std::wstring& path)
+{
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+        (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+bool ProgressShellItemsNeedOverallBar(IShellItemArray* items)
+{
+    if (!items)
+        return false;
+
+    DWORD count = 0;
+    if (FAILED(items->GetCount(&count)) || count == 0)
+        return false;
+
+    if (count > 1)
+        return true;
+
+    IShellItem* item = nullptr;
+    if (FAILED(items->GetItemAt(0, &item)) || !item)
+        return false;
+
+    SFGAOF attributes = 0;
+    const bool isFolder =
+        SUCCEEDED(item->GetAttributes(SFGAO_FOLDER, &attributes)) &&
+        (attributes & SFGAO_FOLDER) != 0;
+    item->Release();
+    return isFolder;
+}
+
+bool ProgressPasteItemsNeedOverallBar(const std::vector<BackgroundPasteItem>& items)
+{
+    if (items.size() > 1)
+        return true;
+
+    return items.size() == 1 && ProgressPathNeedsOverallBar(items.front().Source);
+}
+
+bool StartBackgroundShellPaste(
+    ShellClipboardData& clip,
+    const std::wstring& destination,
+    std::vector<BackgroundShellPastePlanItem> plan,
+    bool usePlan,
+    bool allowSystemConflictUi)
+{
+    bool expected = false;
+    if (!g_BackgroundOperationRunning.compare_exchange_strong(expected, true))
+    {
+        ShowMessage(Msg(MOperationAlreadyRunning));
+        return true;
+    }
+
+    IStream* marshaled = nullptr;
+    const HRESULT marshalResult = CoMarshalInterThreadInterfaceInStream(
+        IID_IDataObject, clip.DataObject, &marshaled);
+    if (FAILED(marshalResult) || !marshaled)
+    {
+        g_BackgroundOperationRunning.store(false);
+        return false;
+    }
+
+    auto* state = new (std::nothrow) BackgroundShellPasteJob();
+    if (!state)
+    {
+        marshaled->Release();
+        g_BackgroundOperationRunning.store(false);
+        return false;
+    }
+
+    state->MarshaledDataObject = marshaled;
+    state->DestinationDirectory = destination;
+    state->Plan = std::move(plan);
+    state->UsePlan = usePlan;
+    state->Move = clip.Move;
+    state->AllowSystemConflictUi = allowSystemConflictUi;
+    state->ShowSystemProgressUi = g_SystemProgressUi;
+    state->ClipboardSequenceAtStart = GetClipboardSequenceNumber();
+
+    const bool showOverallProgress = state->UsePlan
+        ? (state->Plan.size() > 1 || ProgressShellItemsNeedOverallBar(clip.Items))
+        : ProgressShellItemsNeedOverallBar(clip.Items);
+    BeginNativeProgress(state->Move, state->ShowSystemProgressUi, showOverallProgress);
+
+    try
+    {
+        std::thread([state]()
+        {
+            const HRESULT coResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+            const bool coInitialized = SUCCEEDED(coResult);
+            HRESULT hr = coInitialized ? S_OK : coResult;
+            BOOL aborted = FALSE;
+
+            IDataObject* dataObject = nullptr;
+            IShellItemArray* items = nullptr;
+            IShellItem* destinationItem = nullptr;
+            IFileOperation* operation = nullptr;
+            FarOperationsProgressDialog* operationProgress = nullptr;
+            FileOperationProgressSink* progressSink = nullptr;
+            DWORD progressCookie = 0;
+            bool progressAdvised = false;
+
+            if (SUCCEEDED(hr))
+            {
+                IStream* stream = state->MarshaledDataObject;
+                state->MarshaledDataObject = nullptr; // CoGet... consumes stream
+                hr = CoGetInterfaceAndReleaseStream(
+                    stream, IID_IDataObject, reinterpret_cast<void**>(&dataObject));
+            }
+
+            if (SUCCEEDED(hr) && state->UsePlan)
+            {
+                hr = SHCreateShellItemArrayFromDataObject(
+                    dataObject, IID_PPV_ARGS(&items));
+            }
+
+            if (SUCCEEDED(hr))
+            {
+                hr = SHCreateItemFromParsingName(
+                    state->DestinationDirectory.c_str(),
+                    nullptr,
+                    IID_PPV_ARGS(&destinationItem));
+            }
+
+            if (SUCCEEDED(hr))
+            {
+                hr = CoCreateInstance(
+                    CLSID_FileOperation,
+                    nullptr,
+                    CLSCTX_INPROC_SERVER,
+                    IID_PPV_ARGS(&operation));
+            }
+
+            if (SUCCEEDED(hr))
+            {
+                progressSink = new (std::nothrow) FileOperationProgressSink();
+                if (progressSink)
+                    progressAdvised = SUCCEEDED(operation->Advise(progressSink, &progressCookie));
+
+                FILEOP_FLAGS flags = FOF_NOCONFIRMMKDIR | FOF_NOCOPYSECURITYATTRIBS;
+                if (!state->AllowSystemConflictUi)
+                    flags |= FOF_NOCONFIRMATION | FOF_NOERRORUI;
+
+                if (!state->ShowSystemProgressUi)
+                {
+                    operationProgress = new (std::nothrow) FarOperationsProgressDialog();
+                    if (operationProgress)
+                    {
+                        const HRESULT progressResult = operation->SetProgressDialog(operationProgress);
+                        if (FAILED(progressResult))
+                        {
+                            operationProgress->Release();
+                            operationProgress = nullptr;
+                        }
+                    }
+
+                    // FOF_SILENT also suppresses progress-dialog callbacks on
+                    // some Shell versions.  When our private progress object
+                    // is installed, leave progress enabled so the fallback can
+                    // still report useful progress / cancellation state between
+                    // Shell work items.  Mid-file cancellation for ordinary
+                    // filesystem paths is handled by CopyFileEx below.  If the
+                    // object is unavailable, keep Explorer's own window hidden.
+                    if (!operationProgress)
+                        flags |= FOF_SILENT;
+                }
+
+                hr = operation->SetOperationFlags(flags);
+
+                if (SUCCEEDED(hr) && !state->UsePlan)
+                {
+                    hr = state->Move
+                        ? operation->MoveItems(dataObject, destinationItem)
+                        : operation->CopyItems(dataObject, destinationItem);
+                }
+                else if (SUCCEEDED(hr))
+                {
+                    for (const auto& planItem : state->Plan)
+                    {
+                        IShellItem* item = nullptr;
+                        hr = items->GetItemAt(planItem.Index, &item);
+                        if (FAILED(hr) || !item)
+                            break;
+
+                        const wchar_t* requestedName =
+                            planItem.NewName.empty() ? nullptr : planItem.NewName.c_str();
+                        hr = state->Move
+                            ? operation->MoveItem(item, destinationItem, requestedName, nullptr)
+                            : operation->CopyItem(item, destinationItem, requestedName, nullptr);
+                        item->Release();
+                        if (FAILED(hr))
+                            break;
+                    }
+                }
+            }
+
+            if (SUCCEEDED(hr) && g_ProgressCancelRequested.load())
+                hr = E_ABORT;
+
+            if (SUCCEEDED(hr))
+                hr = operation->PerformOperations();
+            if (operation)
+                operation->GetAnyOperationsAborted(&aborted);
+
+            if (operation && progressAdvised)
+                operation->Unadvise(progressCookie);
+            if (progressSink)
+                progressSink->Release();
+            if (operation)
+                operation->Release();
+            if (operationProgress)
+                operationProgress->Release();
+            if (destinationItem)
+                destinationItem->Release();
+            if (items)
+                items->Release();
+            if (dataObject)
+                dataObject->Release();
+            if (coInitialized)
+                CoUninitialize();
+
+            state->Result = hr;
+            state->Aborted = aborted != FALSE || hr == E_ABORT || g_ProgressCancelRequested.load();
+
+            if (g_Info.AdvControl)
+            {
+                g_Info.AdvControl(&PluginGuid, ACTL_SYNCHRO, 0, state);
+            }
+            else
+            {
+                g_BackgroundOperationRunning.store(false);
+                delete state;
+            }
+        }).detach();
+
+        // The file operation itself is on the worker thread.  Keep Far's
+        // main thread inside the modal progress dialog so Enter, Esc, F10 and
+        // mouse clicks belong to that dialog instead of leaking to the panel.
+        RunNativeProgressDialog();
+    }
+    catch (...)
+    {
+        EndNativeProgress();
+        g_BackgroundOperationRunning.store(false);
+        delete state;
+        return false;
+    }
+
+    return true;
+}
+
 bool ReadClipboardFiles(ClipboardFiles& out)
 {
     out = {};
@@ -1036,6 +3344,15 @@ std::wstring BuildDoubleNullSingle(const std::wstring& value)
     return result;
 }
 
+FILEOP_FLAGS ApplySystemProgressPreference(FILEOP_FLAGS flags)
+{
+    // Plugin-managed paths report failures through Far, not Explorer popups.
+    flags |= FOF_NOERRORUI;
+    if (!g_SystemProgressUi)
+        flags |= FOF_SILENT;
+    return flags;
+}
+
 bool RunShellOperation(
     UINT function,
     const std::vector<std::wstring>& fromPaths,
@@ -1141,58 +3458,465 @@ void UpdateClipboardAfterPartialMove(const std::vector<std::wstring>& originalSo
         WriteClipboardFiles(remaining, DROPEFFECT_MOVE);
 }
 
-bool PasteClipboardFilesUsingShell(
-    const ClipboardFiles& clip,
-    const std::wstring& destination)
+bool RunBackgroundShellOperation(
+    UINT function,
+    const std::vector<std::wstring>& fromPaths,
+    const std::vector<std::wstring>& toPaths,
+    FILEOP_FLAGS flags,
+    int& errorCode,
+    bool& aborted)
 {
-    FileActionRecord candidate{};
-    const bool candidateSafe = BuildSafeActionRecord(
-        clip.Paths,
-        destination,
-        clip.Move ? FileAction::Move : FileAction::Copy,
-        candidate);
+    errorCode = 0;
+    aborted = false;
 
-    const std::wstring from = BuildDoubleNullList(clip.Paths);
-    const std::wstring to   = BuildDoubleNullSingle(destination);
+    if (fromPaths.empty() || toPaths.empty())
+        return false;
 
-    SHFILEOPSTRUCTW op{};
-    op.hwnd = GetConsoleWindow();
-    op.wFunc = clip.Move ? FO_MOVE : FO_COPY;
-    op.pFrom = from.c_str();
-    op.pTo = to.c_str();
-    op.fFlags = FOF_NOCONFIRMMKDIR | FOF_NOCOPYSECURITYATTRIBS;
+    IFileOperation* operation = nullptr;
+    HRESULT hr = CoCreateInstance(
+        CLSID_FileOperation,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(&operation));
 
-    const int rc = SHFileOperationW(&op);
+    FarOperationsProgressDialog* operationProgress = nullptr;
+    FileOperationProgressSink* sink = nullptr;
+    DWORD adviseCookie = 0;
+    bool advised = false;
+
+    if (SUCCEEDED(hr))
+    {
+        sink = new (std::nothrow) FileOperationProgressSink();
+        if (sink)
+        {
+            const HRESULT adviseResult = operation->Advise(sink, &adviseCookie);
+            advised = SUCCEEDED(adviseResult);
+        }
+
+        if ((flags & FOF_SILENT) != 0)
+        {
+            operationProgress = new (std::nothrow) FarOperationsProgressDialog();
+            if (operationProgress)
+            {
+                const HRESULT progressResult = operation->SetProgressDialog(operationProgress);
+                if (FAILED(progressResult))
+                {
+                    operationProgress->Release();
+                    operationProgress = nullptr;
+                }
+            }
+        }
+
+        FILEOP_FLAGS operationFlags =
+            static_cast<FILEOP_FLAGS>(flags & ~FOF_MULTIDESTFILES);
+        if (operationProgress)
+            operationFlags = static_cast<FILEOP_FLAGS>(operationFlags & ~FOF_SILENT);
+        hr = operation->SetOperationFlags(operationFlags);
+    }
+
+    const bool multiDestination = (flags & FOF_MULTIDESTFILES) != 0;
+
+    for (size_t i = 0; SUCCEEDED(hr) && i < fromPaths.size(); ++i)
+    {
+        if (g_ProgressCancelRequested.load())
+        {
+            hr = E_ABORT;
+            break;
+        }
+
+        std::wstring target;
+        if (multiDestination)
+        {
+            if (i >= toPaths.size())
+            {
+                hr = E_INVALIDARG;
+                break;
+            }
+            target = toPaths[i];
+        }
+        else
+        {
+            target = toPaths.front();
+        }
+        if (target.empty())
+        {
+            hr = E_INVALIDARG;
+            break;
+        }
+
+        const std::wstring destinationDirectory = multiDestination
+            ? ParentDirectory(target)
+            : target;
+        const std::wstring newName = multiDestination ? BaseName(target) : std::wstring();
+        if (destinationDirectory.empty())
+        {
+            hr = E_INVALIDARG;
+            break;
+        }
+
+        IShellItem* sourceItem = nullptr;
+        IShellItem* destinationItem = nullptr;
+        hr = SHCreateItemFromParsingName(
+            fromPaths[i].c_str(),
+            nullptr,
+            IID_PPV_ARGS(&sourceItem));
+        if (SUCCEEDED(hr))
+        {
+            hr = SHCreateItemFromParsingName(
+                destinationDirectory.c_str(),
+                nullptr,
+                IID_PPV_ARGS(&destinationItem));
+        }
+
+        if (SUCCEEDED(hr))
+        {
+            const wchar_t* requestedName = multiDestination ? newName.c_str() : nullptr;
+            hr = function == FO_MOVE
+                ? operation->MoveItem(sourceItem, destinationItem, requestedName, nullptr)
+                : operation->CopyItem(sourceItem, destinationItem, requestedName, nullptr);
+        }
+
+        if (destinationItem)
+            destinationItem->Release();
+        if (sourceItem)
+            sourceItem->Release();
+    }
+
+    if (SUCCEEDED(hr) && g_ProgressCancelRequested.load())
+        hr = E_ABORT;
+
+    if (SUCCEEDED(hr))
+        hr = operation->PerformOperations();
+
+    BOOL anyAborted = FALSE;
+    if (operation)
+        operation->GetAnyOperationsAborted(&anyAborted);
+
+    if (operation && advised)
+        operation->Unadvise(adviseCookie);
+    if (sink)
+        sink->Release();
+    if (operation)
+        operation->Release();
+    if (operationProgress)
+        operationProgress->Release();
+
+    aborted = anyAborted != FALSE || hr == E_ABORT || g_ProgressCancelRequested.load();
+    errorCode = static_cast<int>(hr);
+    return SUCCEEDED(hr) && !aborted;
+}
+
+void CompleteBackgroundPaste(BackgroundPasteJob* job)
+{
+    if (!job)
+        return;
+
+    DebugLog(
+        L"CompleteBackgroundPaste failed=%d aborted=%d anyPerformed=%d errorCode=%d",
+        job->Failed ? 1 : 0,
+        job->Aborted ? 1 : 0,
+        job->AnyPerformed ? 1 : 0,
+        job->ErrorCode);
+
+    EndNativeProgress();
     RefreshPanel();
 
-    if (rc == 0 && !op.fAnyOperationsAborted)
+    if (job->AnyPerformed)
     {
         ClearRecord(g_UndoRecord);
         ClearRecord(g_RedoRecord);
 
-        if (candidateSafe && FinalizeCompletedAction(candidate))
-            g_UndoRecord = std::move(candidate);
-
-        if (clip.Move)
-            ClearClipboardAfterMove();
-        return true;
+        if (!job->Failed && !job->Aborted && job->CandidateSafe &&
+            FinalizeCompletedAction(job->Candidate))
+        {
+            g_UndoRecord = std::move(job->Candidate);
+        }
     }
 
-    // A Shell operation can be partially completed before it is cancelled or
-    // fails. The previous history can no longer be trusted in that case.
+    if (job->Move && (job->AnyPerformed || job->Failed || job->Aborted))
+    {
+        // Do not destroy a newer clipboard created while the copy/move was
+        // running in the background.
+        if (GetClipboardSequenceNumber() == job->ClipboardSequenceAtStart)
+        {
+            if (!job->Failed && !job->Aborted)
+                ClearClipboardAfterMove();
+            else
+                UpdateClipboardAfterPartialMove(job->OriginalSources);
+        }
+    }
+
+    if (job->Failed && job->ErrorCode)
+    {
+        ShowMessage(
+            std::wstring(Msg(MOperationFailedPrefix)) + L" " +
+            std::to_wstring(job->ErrorCode),
+            true);
+    }
+
+    g_BackgroundOperationRunning.store(false);
+    delete job;
+}
+
+void CompleteBackgroundShellPaste(BackgroundShellPasteJob* job)
+{
+    if (!job)
+        return;
+
+    EndNativeProgress();
+    RefreshPanel();
+
+    // Virtual Shell objects do not have a stable filesystem source path, so
+    // they are intentionally not entered into FarFileClipboard Undo/Redo.
     ClearRecord(g_UndoRecord);
     ClearRecord(g_RedoRecord);
 
-    if (clip.Move)
-        UpdateClipboardAfterPartialMove(clip.Paths);
-
-    if (op.fAnyOperationsAborted)
+    if (job->Move && SUCCEEDED(job->Result) && !job->Aborted &&
+        GetClipboardSequenceNumber() == job->ClipboardSequenceAtStart)
     {
+        ClearClipboardAfterMove();
+    }
+
+    if (FAILED(job->Result) && !job->Aborted)
+    {
+        ShowMessage(
+            std::wstring(Msg(MOperationFailedPrefix)) + L" HRESULT=" +
+            std::to_wstring(static_cast<unsigned long>(job->Result)),
+            true);
+    }
+
+    g_BackgroundOperationRunning.store(false);
+    delete job;
+}
+
+
+bool StartBackgroundPaste(BackgroundPasteJob job)
+{
+    DebugLog(
+        L"StartBackgroundPaste requested move=%d items=%llu systemUi=%d conflictUi=%d kind=%d",
+        job.Move ? 1 : 0,
+        static_cast<unsigned long long>(job.Items.size()),
+        job.ShowSystemProgressUi ? 1 : 0,
+        job.AllowSystemConflictUi ? 1 : 0,
+        static_cast<int>(job.Kind));
+
+    bool expected = false;
+    if (!g_BackgroundOperationRunning.compare_exchange_strong(expected, true))
+    {
+        ShowMessage(Msg(MOperationAlreadyRunning));
         return true;
     }
 
-    ShowMessage(std::wstring(Msg(MOperationFailedPrefix)) + L" " + std::to_wstring(rc), true);
+    job.ClipboardSequenceAtStart = GetClipboardSequenceNumber();
+    auto* state = new (std::nothrow) BackgroundPasteJob(std::move(job));
+    if (!state)
+    {
+        g_BackgroundOperationRunning.store(false);
+        ShowMessage(Msg(MBackgroundStartFailed), true);
+        return true;
+    }
+
+    const bool showOverallProgress = ProgressPasteItemsNeedOverallBar(state->Items);
+    DebugLog(L"StartBackgroundPaste showOverallProgress=%d", showOverallProgress ? 1 : 0);
+    BeginNativeProgress(state->Move, state->ShowSystemProgressUi, showOverallProgress);
+
+    try
+    {
+        std::thread([state]()
+        {
+            DebugLog(
+                L"background worker ENTER move=%d items=%llu",
+                state->Move ? 1 : 0,
+                static_cast<unsigned long long>(state->Items.size()));
+            const HRESULT coResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+            const bool coInitialized = SUCCEEDED(coResult);
+            DebugLog(
+                L"background worker CoInitializeEx hr=0x%08lX initialized=%d",
+                static_cast<unsigned long>(coResult),
+                coInitialized ? 1 : 0);
+
+            FILEOP_FLAGS flags = FOF_NOCONFIRMMKDIR | FOF_NOCOPYSECURITYATTRIBS;
+            if (!state->ShowSystemProgressUi)
+                flags |= FOF_SILENT;
+            if (!state->AllowSystemConflictUi)
+                flags |= FOF_NOCONFIRMATION | FOF_NOERRORUI;
+
+            const UINT function = state->Move ? FO_MOVE : FO_COPY;
+
+            auto runOperation = [&](const std::vector<std::wstring>& sources,
+                                    const std::vector<std::wstring>& targets,
+                                    FILEOP_FLAGS operationFlags,
+                                    int& rc,
+                                    bool& aborted)
+            {
+                // The Far-native progress UI must have a real, immediate
+                // cancellation primitive.  Use CopyFileEx /
+                // MoveFileWithProgress for ordinary filesystem paths; these
+                // APIs explicitly cancel the current file.  Keep
+                // IFileOperation only when the user deliberately asked for
+                // Windows UI/conflict handling or when a tree contains a
+                // reparse point that needs Shell semantics.
+                if (!state->ShowSystemProgressUi && !state->AllowSystemConflictUi)
+                {
+                    bool unsupported = false;
+                    DebugLog(
+                        L"runOperation native engine START sources=%llu targets=%llu flags=0x%08X",
+                        static_cast<unsigned long long>(sources.size()),
+                        static_cast<unsigned long long>(targets.size()),
+                        static_cast<unsigned>(operationFlags));
+                    const bool ok = RunCancellableFileSystemOperation(
+                        function, sources, targets, operationFlags,
+                        rc, aborted, unsupported);
+                    DebugLog(
+                        L"runOperation native engine END ok=%d rc=%d aborted=%d unsupported=%d cancelRequested=%d",
+                        ok ? 1 : 0,
+                        rc,
+                        aborted ? 1 : 0,
+                        unsupported ? 1 : 0,
+                        g_ProgressCancelRequested.load() ? 1 : 0);
+                    if (!unsupported || aborted || g_ProgressCancelRequested.load())
+                        return ok;
+
+                    g_ProgressOverallTotalBytes.store(0);
+                    g_ProgressOverallDoneBytes.store(0);
+                    QueueProgressRedraw();
+                }
+
+                DebugLog(L"runOperation SHELL fallback START");
+                const bool shellOk = RunBackgroundShellOperation(
+                    function, sources, targets, operationFlags, rc, aborted);
+                DebugLog(
+                    L"runOperation SHELL fallback END ok=%d rc=%d aborted=%d cancelRequested=%d",
+                    shellOk ? 1 : 0,
+                    rc,
+                    aborted ? 1 : 0,
+                    g_ProgressCancelRequested.load() ? 1 : 0);
+                return shellOk;
+            };
+
+            if (state->Kind == BackgroundPasteKind::ToDirectory)
+            {
+                std::vector<std::wstring> sources;
+                sources.reserve(state->Items.size());
+                for (const auto& item : state->Items)
+                    sources.push_back(item.Source);
+
+                int rc = 0;
+                bool aborted = false;
+                const bool ok = runOperation(
+                    sources,
+                    { state->DestinationDirectory },
+                    flags,
+                    rc,
+                    aborted);
+
+                // IFileOperation can still stop after partially changing disk.
+                // Once it was invoked, completion must conservatively replace
+                // the previous one-level history.
+                state->AnyPerformed = true;
+                state->Failed = !ok && !aborted;
+                state->Aborted = aborted;
+                state->ErrorCode = rc;
+            }
+            else
+            {
+                flags |= FOF_MULTIDESTFILES;
+
+                std::vector<std::wstring> sources;
+                std::vector<std::wstring> targets;
+                sources.reserve(state->Items.size());
+                targets.reserve(state->Items.size());
+                for (const auto& item : state->Items)
+                {
+                    sources.push_back(item.Source);
+                    targets.push_back(item.Target);
+                }
+
+                int rc = 0;
+                bool aborted = false;
+                const bool ok = runOperation(
+                    sources,
+                    targets,
+                    flags,
+                    rc,
+                    aborted);
+
+                state->AnyPerformed = true;
+                state->Failed = !ok && !aborted;
+                state->Aborted = aborted;
+                state->ErrorCode = rc;
+            }
+
+            if (coInitialized)
+                CoUninitialize();
+
+            DebugLog(
+                L"background worker COMPLETE failed=%d aborted=%d errorCode=%d cancelRequested=%d",
+                state->Failed ? 1 : 0,
+                state->Aborted ? 1 : 0,
+                state->ErrorCode,
+                g_ProgressCancelRequested.load() ? 1 : 0);
+
+            if (g_Info.AdvControl)
+            {
+                const intptr_t syncResult = g_Info.AdvControl(&PluginGuid, ACTL_SYNCHRO, 0, state);
+                DebugLog(L"background worker ACTL_SYNCHRO completion result=%lld", static_cast<long long>(syncResult));
+            }
+            else
+            {
+                g_BackgroundOperationRunning.store(false);
+                delete state;
+            }
+        }).detach();
+
+        DebugLog(L"StartBackgroundPaste worker started; entering modal progress dialog");
+        RunNativeProgressDialog();
+        DebugLog(L"StartBackgroundPaste returned from modal progress dialog");
+    }
+    catch (...)
+    {
+        EndNativeProgress();
+        g_BackgroundOperationRunning.store(false);
+        delete state;
+        ShowMessage(Msg(MBackgroundStartFailed), true);
+    }
+
     return true;
+}
+
+bool PasteClipboardFilesUsingShell(
+    const ClipboardFiles& clip,
+    const std::wstring& destination)
+{
+    BackgroundPasteJob job{};
+    job.Kind = BackgroundPasteKind::ToDirectory;
+    job.Move = clip.Move;
+    // Windows conflict UI is only needed when there is actually a top-level
+    // collision.  Without a collision, even "Windows behavior" can use the
+    // cancellable native transfer engine and still produce the same result.
+    job.AllowSystemConflictUi =
+        g_ConflictMode == ConflictMode::System &&
+        HasTopLevelCollision(clip.Paths, destination);
+    job.ShowSystemProgressUi = g_SystemProgressUi;
+    job.DestinationDirectory = destination;
+    job.OriginalSources = clip.Paths;
+    job.Items.reserve(clip.Paths.size());
+
+    for (const auto& source : clip.Paths)
+    {
+        BackgroundPasteItem item{};
+        item.Source = source;
+        item.Target = JoinPath(destination, BaseName(source));
+        job.Items.push_back(std::move(item));
+    }
+
+    job.CandidateSafe = BuildSafeActionRecord(
+        clip.Paths,
+        destination,
+        clip.Move ? FileAction::Move : FileAction::Copy,
+        job.Candidate);
+
+    return StartBackgroundPaste(std::move(job));
 }
 
 bool PasteClipboardFilesWithFarConflicts(const ClipboardFiles& clip, const std::wstring& destination);
@@ -1273,80 +3997,68 @@ bool FindAutoRenameTarget(
 
 bool PasteClipboardFilesWithAutoRename(const ClipboardFiles& clip, const std::wstring& destination)
 {
-    bool anyPerformed = false;
-    bool failed = false;
-    bool cancelled = false;
-    int failureCode = 0;
-    bool historySafe = true;
+    BackgroundPasteJob job{};
+    job.Kind = BackgroundPasteKind::ExactTargets;
+    job.Move = clip.Move;
+    job.AllowSystemConflictUi = false;
+    job.ShowSystemProgressUi = g_SystemProgressUi;
+    job.OriginalSources = clip.Paths;
+    job.Candidate.Action = clip.Move ? FileAction::Move : FileAction::Copy;
 
-    FileActionRecord candidate{};
-    candidate.Action = clip.Move ? FileAction::Move : FileAction::Copy;
+    bool historySafe = true;
+    job.Items.reserve(clip.Paths.size());
+    job.Candidate.Items.reserve(clip.Paths.size());
 
     for (const auto& source : clip.Paths)
     {
+        if (!PathExists(source))
+        {
+            ShowMessage(std::wstring(Msg(MObjectNotFound)) + L"\n" + source, true);
+            return true;
+        }
+
         std::wstring target;
         if (!FindAutoRenameTarget(source, destination, target))
         {
             ShowMessage(Msg(MAutoRenameFailed), true);
-            failed = true;
-            historySafe = false;
-            break;
+            return true;
         }
 
-        FileActionItem historyItem{};
-        historyItem.Source = source;
-        historyItem.Destination = target;
-        if (!GetFileIdentity(source, historyItem.SourceIdentity))
-            historySafe = false;
+        BackgroundPasteItem operation{};
+        operation.Source = source;
+        operation.Target = target;
+        job.Items.push_back(std::move(operation));
 
-        int rc = 0;
-        bool aborted = false;
-        const bool ok = RunExactCopyOrMove(clip.Move, source, target, rc, aborted);
-        if (!ok)
-        {
-            failed = true;
-            cancelled = aborted;
-            failureCode = rc;
-            historySafe = false;
-            break;
-        }
-
-        anyPerformed = true;
         if (historySafe)
         {
-            if (GetFileIdentity(target, historyItem.DestinationIdentity))
-                candidate.Items.push_back(std::move(historyItem));
+            FileActionItem historyItem{};
+            historyItem.Source = source;
+            historyItem.Destination = target;
+            if (GetFileIdentity(source, historyItem.SourceIdentity))
+                job.Candidate.Items.push_back(std::move(historyItem));
             else
                 historySafe = false;
         }
     }
 
-    RefreshPanel();
+    job.CandidateSafe = historySafe &&
+        job.Candidate.Items.size() == job.Items.size() &&
+        !job.Items.empty();
 
-    if (anyPerformed)
-    {
-        ClearRecord(g_UndoRecord);
-        ClearRecord(g_RedoRecord);
-        if (historySafe && !candidate.Items.empty())
-            g_UndoRecord = std::move(candidate);
-    }
-
-    if (clip.Move && (anyPerformed || cancelled || failed))
-        UpdateClipboardAfterPartialMove(clip.Paths);
-
-    if (cancelled)
-    {
+    if (job.Items.empty())
         return true;
-    }
 
-    if (failed && failureCode)
-        ShowMessage(std::wstring(Msg(MOperationFailedPrefix)) + L" " + std::to_wstring(failureCode), true);
-
-    return true;
+    return StartBackgroundPaste(std::move(job));
 }
 
 bool PasteClipboardFilesToDirectory(const std::wstring& destination)
 {
+    if (g_BackgroundOperationRunning.load())
+    {
+        ShowMessage(Msg(MOperationAlreadyRunning));
+        return true;
+    }
+
     ClipboardFiles clip;
     if (!ReadClipboardFiles(clip))
         return PasteShellClipboardToDirectory(destination);
@@ -1539,6 +4251,12 @@ bool UndoLastOperation()
     if (!IsPanelsWindow())
         return false;
 
+    if (g_BackgroundOperationRunning.load())
+    {
+        ShowMessage(Msg(MOperationAlreadyRunning));
+        return true;
+    }
+
     if (!HasRecord(g_UndoRecord))
     {
         ShowMessage(Msg(MUndoUnavailable));
@@ -1572,7 +4290,7 @@ bool UndoLastOperation()
             FO_DELETE,
             targets,
             {},
-            FOF_ALLOWUNDO,
+            ApplySystemProgressPreference(FOF_ALLOWUNDO),
             rc,
             aborted);
     }
@@ -1599,7 +4317,8 @@ bool UndoLastOperation()
             FO_MOVE,
             from,
             to,
-            FOF_MULTIDESTFILES | FOF_NOCONFIRMMKDIR | FOF_NOCOPYSECURITYATTRIBS,
+            ApplySystemProgressPreference(
+                FOF_MULTIDESTFILES | FOF_NOCONFIRMMKDIR | FOF_NOCOPYSECURITYATTRIBS),
             rc,
             aborted);
     }
@@ -1646,6 +4365,12 @@ bool RedoLastOperation()
     if (!IsPanelsWindow())
         return false;
 
+    if (g_BackgroundOperationRunning.load())
+    {
+        ShowMessage(Msg(MOperationAlreadyRunning));
+        return true;
+    }
+
     if (!HasRecord(g_RedoRecord))
     {
         ShowMessage(Msg(MRedoUnavailable));
@@ -1677,7 +4402,8 @@ bool RedoLastOperation()
         function,
         from,
         to,
-        FOF_MULTIDESTFILES | FOF_NOCONFIRMMKDIR | FOF_NOCOPYSECURITYATTRIBS,
+        ApplySystemProgressPreference(
+            FOF_MULTIDESTFILES | FOF_NOCONFIRMMKDIR | FOF_NOCOPYSECURITYATTRIBS),
         rc,
         aborted);
 
@@ -1844,6 +4570,10 @@ void LoadSettings()
         g_PrecheckInvalidOperations = number != 0;
 
     number = 0;
+    if (ReadNumberSetting(settings.Handle, SystemProgressUiSetting, number))
+        g_SystemProgressUi = number != 0;
+
+    number = 0;
     if (ReadNumberSetting(settings.Handle, ConflictModeSetting, number) &&
         number <= static_cast<unsigned long long>(ConflictMode::AutoRename))
         g_ConflictMode = static_cast<ConflictMode>(number);
@@ -1865,6 +4595,7 @@ bool SaveSettings(
     const std::wstring& undoHotkey,
     const std::wstring& redoHotkey,
     bool precheckInvalidOperations,
+    bool systemProgressUi,
     ConflictMode conflictMode,
     const std::wstring& autoRenameTemplate)
 {
@@ -1879,10 +4610,11 @@ bool SaveSettings(
     const bool undoOk = WriteStringSetting(settings.Handle, UndoHotkeySetting, undoHotkey);
     const bool redoOk = WriteStringSetting(settings.Handle, RedoHotkeySetting, redoHotkey);
     const bool precheckOk = WriteNumberSetting(settings.Handle, PrecheckInvalidSetting, precheckInvalidOperations ? 1ULL : 0ULL);
+    const bool progressUiOk = WriteNumberSetting(settings.Handle, SystemProgressUiSetting, systemProgressUi ? 1ULL : 0ULL);
     const bool conflictOk = WriteNumberSetting(settings.Handle, ConflictModeSetting, static_cast<unsigned long long>(conflictMode));
     const bool templateOk = WriteStringSetting(settings.Handle, AutoRenameTemplateSetting, autoRenameTemplate);
     g_Info.SettingsControl(settings.Handle, SCTL_FREE, 0, nullptr);
-    return copyOk && cutOk && pasteOk && pasteIntoOk && undoOk && redoOk && precheckOk && conflictOk && templateOk;
+    return copyOk && cutOk && pasteOk && pasteIntoOk && undoOk && redoOk && precheckOk && progressUiOk && conflictOk && templateOk;
 }
 
 FarDialogItem MakeDialogItem(
@@ -2059,8 +4791,9 @@ bool RunExactCopyOrMove(
         move ? FO_MOVE : FO_COPY,
         { source },
         { target },
-        FOF_MULTIDESTFILES | FOF_NOCONFIRMATION |
-            FOF_NOCONFIRMMKDIR | FOF_NOCOPYSECURITYATTRIBS,
+        ApplySystemProgressPreference(
+            FOF_MULTIDESTFILES | FOF_NOCONFIRMATION |
+            FOF_NOCONFIRMMKDIR | FOF_NOCOPYSECURITYATTRIBS),
         errorCode,
         aborted);
 }
@@ -2160,98 +4893,18 @@ bool FindAutoRenameTargetForObject(
     return false;
 }
 
-bool PerformShellClipboardOperation(
-    ShellClipboardData& clip,
-    const std::wstring& destination,
-    bool useSystemConflictUi)
-{
-    IShellItem* destinationItem = nullptr;
-    HRESULT hr = SHCreateItemFromParsingName(
-        destination.c_str(), nullptr, IID_PPV_ARGS(&destinationItem));
-    if (FAILED(hr) || !destinationItem)
-        return false;
-
-    IFileOperation* operation = nullptr;
-    hr = CoCreateInstance(
-        CLSID_FileOperation,
-        nullptr,
-        CLSCTX_INPROC_SERVER,
-        IID_PPV_ARGS(&operation));
-    if (FAILED(hr) || !operation)
-    {
-        destinationItem->Release();
-        return false;
-    }
-
-    FILEOP_FLAGS flags = FOF_NOCONFIRMMKDIR | FOF_NOCOPYSECURITYATTRIBS;
-    if (!useSystemConflictUi)
-        flags |= FOF_NOCONFIRMATION;
-    operation->SetOperationFlags(flags);
-
-    hr = clip.Move
-        ? operation->MoveItems(clip.DataObject, destinationItem)
-        : operation->CopyItems(clip.DataObject, destinationItem);
-    if (SUCCEEDED(hr))
-        hr = operation->PerformOperations();
-
-    BOOL aborted = FALSE;
-    if (SUCCEEDED(hr))
-        operation->GetAnyOperationsAborted(&aborted);
-
-    operation->Release();
-    destinationItem->Release();
-    RefreshPanel();
-
-    if (FAILED(hr))
-    {
-        ShowMessage(std::wstring(Msg(MOperationFailedPrefix)) + L" HRESULT=" +
-            std::to_wstring(static_cast<unsigned long>(hr)), true);
-        return true;
-    }
-
-    if (aborted)
-    {
-        return true;
-    }
-
-    ClearRecord(g_UndoRecord);
-    ClearRecord(g_RedoRecord);
-    if (clip.Move)
-        ClearClipboardAfterMove();
-    return true;
-}
-
 bool PasteShellClipboardWithPluginConflicts(
     ShellClipboardData& clip,
     const std::wstring& destination)
 {
-    IShellItem* destinationItem = nullptr;
-    HRESULT hr = SHCreateItemFromParsingName(
-        destination.c_str(), nullptr, IID_PPV_ARGS(&destinationItem));
-    if (FAILED(hr) || !destinationItem)
-        return false;
-
-    IFileOperation* operation = nullptr;
-    hr = CoCreateInstance(
-        CLSID_FileOperation,
-        nullptr,
-        CLSCTX_INPROC_SERVER,
-        IID_PPV_ARGS(&operation));
-    if (FAILED(hr) || !operation)
-    {
-        destinationItem->Release();
-        return false;
-    }
-
-    operation->SetOperationFlags(
-        FOF_NOCONFIRMATION | FOF_NOCONFIRMMKDIR | FOF_NOCOPYSECURITYATTRIBS);
-
     DWORD count = 0;
-    clip.Items->GetCount(&count);
+    if (FAILED(clip.Items->GetCount(&count)))
+        return false;
+
     bool stickyDecisionActive = false;
     ConflictChoice stickyChoice = ConflictChoice::Cancel;
-    bool queuedAny = false;
-    bool cancelled = false;
+    std::vector<BackgroundShellPastePlanItem> plan;
+    plan.reserve(count);
 
     for (DWORD i = 0; i < count; ++i)
     {
@@ -2267,6 +4920,7 @@ bool PasteShellClipboardWithPluginConflicts(
             item->Release();
             continue;
         }
+        item->Release();
 
         std::wstring newName;
         const std::wstring originalTarget = JoinPath(destination, originalName);
@@ -2278,10 +4932,7 @@ bool PasteShellClipboardWithPluginConflicts(
             if (!FindAutoRenameTargetForObject(
                     originalName, directory, destination, newName))
             {
-                item->Release();
                 ShowMessage(Msg(MAutoRenameFailed), true);
-                operation->Release();
-                destinationItem->Release();
                 return true;
             }
         }
@@ -2321,10 +4972,7 @@ bool PasteShellClipboardWithPluginConflicts(
                     break;
                 }
                 if (decision.Choice == ConflictChoice::Cancel)
-                {
-                    cancelled = true;
-                    break;
-                }
+                    return true;
                 if (decision.Choice == ConflictChoice::Replace)
                     break;
 
@@ -2344,68 +4992,15 @@ bool PasteShellClipboardWithPluginConflicts(
             }
         }
 
-        if (cancelled)
-        {
-            item->Release();
-            break;
-        }
-        if (skipItem)
-        {
-            item->Release();
-            continue;
-        }
-
-        const wchar_t* requestedName = newName.empty() ? nullptr : newName.c_str();
-        hr = clip.Move
-            ? operation->MoveItem(item, destinationItem, requestedName, nullptr)
-            : operation->CopyItem(item, destinationItem, requestedName, nullptr);
-        item->Release();
-        if (FAILED(hr))
-        {
-            operation->Release();
-            destinationItem->Release();
-            ShowMessage(std::wstring(Msg(MOperationFailedPrefix)) + L" HRESULT=" +
-                std::to_wstring(static_cast<unsigned long>(hr)), true);
-            return true;
-        }
-        queuedAny = true;
+        if (!skipItem)
+            plan.push_back({ i, std::move(newName) });
     }
 
-    if (cancelled || !queuedAny)
-    {
-        operation->Release();
-        destinationItem->Release();
-        if (cancelled)
-            return true;
-    }
-
-    hr = operation->PerformOperations();
-    BOOL aborted = FALSE;
-    if (SUCCEEDED(hr))
-        operation->GetAnyOperationsAborted(&aborted);
-
-    operation->Release();
-    destinationItem->Release();
-    RefreshPanel();
-
-    // A Shell namespace source can be virtual (ZIP, Libraries, search results,
-    // etc.), so the filesystem-path based Undo / Redo journal is not safe here.
-    ClearRecord(g_UndoRecord);
-    ClearRecord(g_RedoRecord);
-
-    if (FAILED(hr))
-    {
-        ShowMessage(std::wstring(Msg(MOperationFailedPrefix)) + L" HRESULT=" +
-            std::to_wstring(static_cast<unsigned long>(hr)), true);
+    if (plan.empty())
         return true;
-    }
-    if (aborted)
-    {
-        return true;
-    }
 
-    if (clip.Move)
-        ClearClipboardAfterMove();
+    if (!StartBackgroundShellPaste(clip, destination, std::move(plan), true, false))
+        ShowMessage(Msg(MBackgroundStartFailed), true);
     return true;
 }
 
@@ -2422,7 +5017,11 @@ bool PasteShellClipboardToDirectory(const std::wstring& destination)
     // view) do not necessarily have real filesystem source paths. Let the
     // Windows Shell materialize them through IFileOperation.
     if (g_ConflictMode == ConflictMode::System)
-        return PerformShellClipboardOperation(clip, destination, true);
+    {
+        if (!StartBackgroundShellPaste(clip, destination, {}, false, true))
+            ShowMessage(Msg(MBackgroundStartFailed), true);
+        return true;
+    }
 
     return PasteShellClipboardWithPluginConflicts(clip, destination);
 }
@@ -2431,36 +5030,34 @@ bool PasteClipboardFilesWithFarConflicts(const ClipboardFiles& clip, const std::
 {
     bool stickyDecisionActive = false;
     ConflictChoice stickyChoice = ConflictChoice::Cancel;
-    bool anyPerformed = false;
-    bool cancelled = false;
-    bool failed = false;
     bool historySafe = true;
-    int failureCode = 0;
 
-    FileActionRecord candidate{};
-    candidate.Action = clip.Move ? FileAction::Move : FileAction::Copy;
+    BackgroundPasteJob job{};
+    job.Kind = BackgroundPasteKind::ExactTargets;
+    job.Move = clip.Move;
+    job.AllowSystemConflictUi = false;
+    job.ShowSystemProgressUi = g_SystemProgressUi;
+    job.OriginalSources = clip.Paths;
+    job.Candidate.Action = clip.Move ? FileAction::Move : FileAction::Copy;
+    job.Items.reserve(clip.Paths.size());
+    job.Candidate.Items.reserve(clip.Paths.size());
 
     for (const auto& source : clip.Paths)
     {
         if (!PathExists(source))
         {
             ShowMessage(std::wstring(Msg(MObjectNotFound)) + L"\n" + source, true);
-            failed = true;
-            historySafe = false;
-            break;
+            return true;
         }
 
         const std::wstring originalName = BaseName(source);
         if (originalName.empty())
-        {
-            failed = true;
-            historySafe = false;
-            break;
-        }
+            return true;
 
         std::wstring target = JoinPath(destination, originalName);
         const bool hadCollision = PathExists(target);
         bool replacingExisting = false;
+        bool skipItem = false;
 
         if (hadCollision)
         {
@@ -2487,12 +5084,16 @@ bool PasteClipboardFilesWithFarConflicts(const ClipboardFiles& clip, const std::
                 }
 
                 if (decision.Choice == ConflictChoice::Skip)
+                {
+                    skipItem = true;
                     break;
+                }
 
                 if (decision.Choice == ConflictChoice::Cancel)
                 {
-                    cancelled = true;
-                    break;
+                    // Planning happens before the worker starts, so Cancel
+                    // really means no file has been changed yet.
+                    return true;
                 }
 
                 if (decision.Choice == ConflictChoice::Replace)
@@ -2517,74 +5118,36 @@ bool PasteClipboardFilesWithFarConflicts(const ClipboardFiles& clip, const std::
                 target = renamedTarget;
                 break;
             }
-
-            if (cancelled)
-                break;
-
-            if (!replacingExisting && PathExists(target))
-            {
-                // The only remaining case is Skip.
-                continue;
-            }
         }
 
-        FileActionItem historyItem{};
-        historyItem.Source = source;
-        historyItem.Destination = target;
-        if (!GetFileIdentity(source, historyItem.SourceIdentity))
-            historySafe = false;
+        if (skipItem)
+            continue;
 
-        int rc = 0;
-        bool aborted = false;
-        const bool ok = RunExactCopyOrMove(clip.Move, source, target, rc, aborted);
-        if (!ok)
-        {
-            failed = true;
-            failureCode = rc;
-            historySafe = false;
-            if (aborted)
-                cancelled = true;
-            break;
-        }
-
-        anyPerformed = true;
+        BackgroundPasteItem operation{};
+        operation.Source = source;
+        operation.Target = target;
+        job.Items.push_back(std::move(operation));
 
         if (!replacingExisting && historySafe)
         {
-            if (GetFileIdentity(target, historyItem.DestinationIdentity))
-                candidate.Items.push_back(std::move(historyItem));
+            FileActionItem historyItem{};
+            historyItem.Source = source;
+            historyItem.Destination = target;
+            if (GetFileIdentity(source, historyItem.SourceIdentity))
+                job.Candidate.Items.push_back(std::move(historyItem));
             else
                 historySafe = false;
         }
     }
 
-    RefreshPanel();
+    job.CandidateSafe = historySafe &&
+        job.Candidate.Items.size() == job.Items.size() &&
+        !job.Items.empty();
 
-    if (anyPerformed)
-    {
-        ClearRecord(g_UndoRecord);
-        ClearRecord(g_RedoRecord);
-
-        if (historySafe && !candidate.Items.empty())
-            g_UndoRecord = std::move(candidate);
-    }
-
-    if (clip.Move && (anyPerformed || cancelled || failed))
-        UpdateClipboardAfterPartialMove(clip.Paths);
-
-    if (cancelled)
-    {
+    if (job.Items.empty())
         return true;
-    }
 
-    if (failed)
-    {
-        if (failureCode)
-            ShowMessage(std::wstring(Msg(MOperationFailedPrefix)) + L" " + std::to_wstring(failureCode), true);
-        return true;
-    }
-
-    return true;
+    return StartBackgroundPaste(std::move(job));
 }
 
 std::array<std::wstring, 6> CurrentHotkeyLetters()
@@ -2668,6 +5231,7 @@ enum ConfigItem : intptr_t
     CfgRedoLabel, CfgRedoPrefix, CfgRedoEdit,
     CfgOperationsSeparator,
     CfgInvalidPrecheck,
+    CfgSystemProgressUi,
     CfgConflictsSeparator,
     CfgConflictAsk,
     CfgConflictSystem,
@@ -2715,6 +5279,7 @@ intptr_t WINAPI ConfigDialogProc(HANDLE dialog, intptr_t msg, intptr_t param1, v
 bool ShowConfigurationDialog(
     std::array<std::wstring, 6>& letters,
     bool& precheckInvalidOperations,
+    bool& systemProgressUi,
     ConflictMode& conflictMode,
     std::wstring& autoRenameTemplate)
 {
@@ -2729,10 +5294,17 @@ bool ShowConfigurationDialog(
 
     while (true)
     {
+        constexpr intptr_t dialogWidth = 86;
+        constexpr intptr_t dialogHeight = 20;
+        constexpr intptr_t boxRight = dialogWidth - 4;
+        constexpr intptr_t separatorRight = boxRight - 2;
+
         FarDialogItem items[CfgCount]{};
-        // Compact Far-style layout: one outer frame, plain separators only,
-        // and no empty spacer rows between logical groups.
-        items[CfgBox] = MakeDialogItem(DI_DOUBLEBOX, 3, 1, 66, 17, DIF_NONE, Msg(MPluginName));
+        // Leave real horizontal breathing room for localized checkbox text.
+        // The old 70-column layout let the Russian progress-UI option write
+        // straight through the right border of the double box.
+        items[CfgBox] = MakeDialogItem(
+            DI_DOUBLEBOX, 3, 1, boxRight, 18, DIF_NONE, Msg(MPluginName));
 
         const MessageId labels[6] = {
             MConfigCopy, MConfigCut, MConfigPaste,
@@ -2757,43 +5329,47 @@ bool ShowConfigurationDialog(
         }
 
         items[CfgOperationsSeparator] = MakeDialogItem(
-            DI_TEXT, 5, 8, 64, 8, DIF_SEPARATOR, L"");
+            DI_TEXT, 5, 8, separatorRight, 8, DIF_SEPARATOR, L"");
         items[CfgInvalidPrecheck] = MakeDialogItem(
             DI_CHECKBOX, 7, 9, 0, 9, DIF_NONE, Msg(MConfigPrecheckInvalid));
         items[CfgInvalidPrecheck].Selected = precheckInvalidOperations ? 1 : 0;
+        items[CfgSystemProgressUi] = MakeDialogItem(
+            DI_CHECKBOX, 7, 10, 0, 10, DIF_NONE, Msg(MConfigSystemProgressUi));
+        items[CfgSystemProgressUi].Selected = systemProgressUi ? 1 : 0;
 
         items[CfgConflictsSeparator] = MakeDialogItem(
-            DI_TEXT, 5, 10, 64, 10, DIF_SEPARATOR, L"");
+            DI_TEXT, 5, 11, separatorRight, 11, DIF_SEPARATOR, L"");
         items[CfgConflictAsk] = MakeDialogItem(
-            DI_RADIOBUTTON, 7, 11, 0, 11, DIF_GROUP, Msg(MConfigConflictAsk));
+            DI_RADIOBUTTON, 7, 12, 0, 12, DIF_GROUP, Msg(MConfigConflictAsk));
         items[CfgConflictAsk].Selected = conflictMode == ConflictMode::Ask ? 1 : 0;
         items[CfgConflictSystem] = MakeDialogItem(
-            DI_RADIOBUTTON, 7, 12, 0, 12, DIF_NONE, Msg(MConfigConflictSystem));
+            DI_RADIOBUTTON, 7, 13, 0, 13, DIF_NONE, Msg(MConfigConflictSystem));
         items[CfgConflictSystem].Selected = conflictMode == ConflictMode::System ? 1 : 0;
         items[CfgConflictAutoRename] = MakeDialogItem(
-            DI_RADIOBUTTON, 7, 13, 0, 13, DIF_NONE, Msg(MConfigConflictAutoRename));
+            DI_RADIOBUTTON, 7, 14, 0, 14, DIF_NONE, Msg(MConfigConflictAutoRename));
         items[CfgConflictAutoRename].Selected = conflictMode == ConflictMode::AutoRename ? 1 : 0;
         const FARDIALOGITEMFLAGS templateDisabled =
             conflictMode == ConflictMode::AutoRename ? DIF_NONE : DIF_DISABLE;
         items[CfgAutoRenameTemplateLabel] = MakeDialogItem(
-            DI_TEXT, 10, 14, 0, 14, templateDisabled, Msg(MConfigAutoRenameTemplate));
+            DI_TEXT, 10, 15, 0, 15, templateDisabled, Msg(MConfigAutoRenameTemplate));
         items[CfgAutoRenameTemplateEdit] = MakeDialogItem(
-            DI_EDIT, 24, 14, 61, 14,
+            DI_EDIT, 24, 15, boxRight - 5, 15,
             DIF_SELECTONENTRY | DIF_NOAUTOCOMPLETE | templateDisabled,
             autoRenameTemplate.c_str(), 128);
 
-        items[CfgBottomSeparator] = MakeDialogItem(DI_TEXT, 5, 15, 64, 15, DIF_SEPARATOR, L"");
-        items[CfgDefaults] = MakeDialogItem(DI_BUTTON, 10, 16, 0, 16, DIF_NONE, Msg(MConfigDefaults));
-        items[CfgOk] = MakeDialogItem(DI_BUTTON, 40, 16, 0, 16, DIF_DEFAULTBUTTON, Msg(MConfigOk));
-        items[CfgCancel] = MakeDialogItem(DI_BUTTON, 51, 16, 0, 16, DIF_NONE, Msg(MConfigCancel));
+        items[CfgBottomSeparator] = MakeDialogItem(
+            DI_TEXT, 5, 16, separatorRight, 16, DIF_SEPARATOR, L"");
+        items[CfgDefaults] = MakeDialogItem(DI_BUTTON, 10, 17, 0, 17, DIF_NONE, Msg(MConfigDefaults));
+        items[CfgOk] = MakeDialogItem(DI_BUTTON, 44, 17, 0, 17, DIF_DEFAULTBUTTON, Msg(MConfigOk));
+        items[CfgCancel] = MakeDialogItem(DI_BUTTON, 56, 17, 0, 17, DIF_NONE, Msg(MConfigCancel));
 
         HANDLE dialog = g_Info.DialogInit(
             &PluginGuid,
             &ConfigDialogGuid,
             -1,
             -1,
-            70,
-            19,
+            dialogWidth,
+            dialogHeight,
             L"Config",
             items,
             CfgCount,
@@ -2818,6 +5394,8 @@ bool ShowConfigurationDialog(
 
             precheckInvalidOperations =
                 g_Info.SendDlgMessage(dialog, DM_GETCHECK, CfgInvalidPrecheck, nullptr) != 0;
+            systemProgressUi =
+                g_Info.SendDlgMessage(dialog, DM_GETCHECK, CfgSystemProgressUi, nullptr) != 0;
 
             if (g_Info.SendDlgMessage(dialog, DM_GETCHECK, CfgConflictSystem, nullptr) != 0)
                 conflictMode = ConflictMode::System;
@@ -2837,6 +5415,7 @@ bool ShowConfigurationDialog(
         {
             SetDefaultHotkeyLetters(letters);
             precheckInvalidOperations = true;
+            systemProgressUi = false;
             conflictMode = ConflictMode::Ask;
             autoRenameTemplate = DefaultAutoRenameTemplate;
             continue;
@@ -2876,7 +5455,7 @@ extern "C" __declspec(dllexport) void WINAPI GetGlobalInfoW(GlobalInfo* info)
 
     info->StructSize = sizeof(GlobalInfo);
     info->MinFarVersion = { 3, 0, 0, 4326, VS_RELEASE };
-    info->Version = { 1, 0, 0, 0, VS_RELEASE };
+    info->Version = { 1, 0, 2, 0, VS_RELEASE };
     info->Guid = PluginGuid;
     info->Title = L"FarFileClipboard";
     info->Description = L"Windows file clipboard integration for Far Manager";
@@ -2889,8 +5468,22 @@ extern "C" __declspec(dllexport) void WINAPI SetStartupInfoW(const PluginStartup
     if (!info)
         return;
 
+    ResetDebugLog();
+    DebugLog(L"=== FarFileClipboard cancellation diagnostic build START ===");
+    DebugLog(L"debugLogPath='%ls'", DebugLogPath().c_str());
+    DebugLog(
+        L"SetStartupInfoW info=%p StructSize=%llu ModuleName='%ls'",
+        info,
+        static_cast<unsigned long long>(info->StructSize),
+        info->ModuleName ? info->ModuleName : L"(null)");
+
     g_Info = *info;
     LoadSettings();
+    DebugLog(
+        L"settings loaded: systemProgressUi=%d conflictMode=%llu precheck=%d",
+        g_SystemProgressUi ? 1 : 0,
+        static_cast<unsigned long long>(g_ConflictMode),
+        g_PrecheckInvalidOperations ? 1 : 0);
 }
 
 extern "C" __declspec(dllexport) void WINAPI GetPluginInfoW(PluginInfo* info)
@@ -2930,9 +5523,10 @@ extern "C" __declspec(dllexport) intptr_t WINAPI ConfigureW(const ConfigureInfo*
 
     auto letters = CurrentHotkeyLetters();
     bool precheckInvalidOperations = g_PrecheckInvalidOperations;
+    bool systemProgressUi = g_SystemProgressUi;
     ConflictMode conflictMode = g_ConflictMode;
     std::wstring autoRenameTemplate = g_AutoRenameTemplate;
-    if (!ShowConfigurationDialog(letters, precheckInvalidOperations, conflictMode, autoRenameTemplate))
+    if (!ShowConfigurationDialog(letters, precheckInvalidOperations, systemProgressUi, conflictMode, autoRenameTemplate))
         return 0;
 
     std::array<std::wstring, 6> hotkeys;
@@ -2962,7 +5556,7 @@ extern "C" __declspec(dllexport) intptr_t WINAPI ConfigureW(const ConfigureInfo*
 
     if (!SaveSettings(
             hotkeys[0], hotkeys[1], hotkeys[2], hotkeys[3], hotkeys[4], hotkeys[5],
-            precheckInvalidOperations, conflictMode, autoRenameTemplate))
+            precheckInvalidOperations, systemProgressUi, conflictMode, autoRenameTemplate))
     {
         ShowMessage(Msg(MSaveSettingsFailed), true);
         return 0;
@@ -2975,6 +5569,7 @@ extern "C" __declspec(dllexport) intptr_t WINAPI ConfigureW(const ConfigureInfo*
     g_UndoHotkey = hotkeys[4];
     g_RedoHotkey = hotkeys[5];
     g_PrecheckInvalidOperations = precheckInvalidOperations;
+    g_SystemProgressUi = systemProgressUi;
     g_ConflictMode = conflictMode;
     g_AutoRenameTemplate = autoRenameTemplate;
     g_CopyHotkeySpec = specs[0];
@@ -2986,13 +5581,58 @@ extern "C" __declspec(dllexport) intptr_t WINAPI ConfigureW(const ConfigureInfo*
     return 1;
 }
 
+extern "C" __declspec(dllexport) intptr_t WINAPI ProcessSynchroEventW(const ProcessSynchroEventInfo* info)
+{
+    if (info && info->Event == SE_COMMONSYNCHRO && info->Param)
+    {
+        if (info->Param == &g_ProgressSyncToken)
+        {
+            UpdateNativeProgress();
+            return 0;
+        }
+
+        auto* job = static_cast<BackgroundJobBase*>(info->Param);
+        DebugLog(
+            L"ProcessSynchroEventW completion param=%p jobType=%d",
+            info->Param,
+            static_cast<int>(job->Type));
+        if (job->Type == BackgroundJobType::FileSystemPaste)
+            CompleteBackgroundPaste(static_cast<BackgroundPasteJob*>(info->Param));
+        else if (job->Type == BackgroundJobType::ShellPaste)
+            CompleteBackgroundShellPaste(static_cast<BackgroundShellPasteJob*>(info->Param));
+    }
+
+    return 0;
+}
+
 extern "C" __declspec(dllexport) intptr_t WINAPI ProcessConsoleInputW(ProcessConsoleInputInfo* info)
 {
-    if (!info || info->Rec.EventType != KEY_EVENT)
+    if (!info)
+        return 0;
+
+#ifdef FFC_CANCEL_DIAGNOSTICS
+    if (g_BackgroundOperationRunning.load() && info->Rec.EventType != 0)
+        DebugLogInputRecord(L"ProcessConsoleInputW while background operation active", info->Rec);
+#endif
+
+    if (info->Rec.EventType != KEY_EVENT)
         return 0;
 
     const KEY_EVENT_RECORD& key = info->Rec.Event.KeyEvent;
-    if (!key.bKeyDown || !IsPanelsWindow())
+    if (!key.bKeyDown)
+        return 0;
+
+    const bool panelsWindow = IsPanelsWindow();
+#ifdef FFC_CANCEL_DIAGNOSTICS
+    if (g_BackgroundOperationRunning.load())
+    {
+        DebugLog(
+            L"ProcessConsoleInputW keyDown vk=0x%04X panelsWindow=%d",
+            static_cast<unsigned>(key.wVirtualKeyCode),
+            panelsWindow ? 1 : 0);
+    }
+#endif
+    if (!panelsWindow)
         return 0;
 
     if (HotkeyMatches(key, g_CopyHotkeySpec))

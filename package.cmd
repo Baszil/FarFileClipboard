@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 setlocal EnableExtensions
 pushd "%~dp0"
 
@@ -24,8 +24,8 @@ call build.cmd %ARCH_NAME%
 if errorlevel 1 goto :fail
 
 set "RELEASE_DIR=%CD%\release"
-set "STAGE=%RELEASE_DIR%\FarFileClipboard-1.0.0-%ARCH_NAME%"
-set "ZIP=%RELEASE_DIR%\FarFileClipboard-1.0.0-%ARCH_NAME%.zip"
+set "STAGE=%RELEASE_DIR%\FarFileClipboard-1.0.2-%ARCH_NAME%"
+set "ZIP=%RELEASE_DIR%\FarFileClipboard-1.0.2-%ARCH_NAME%.zip"
 
 if not exist "%RELEASE_DIR%" mkdir "%RELEASE_DIR%"
 if exist "%STAGE%" rmdir /S /Q "%STAGE%"

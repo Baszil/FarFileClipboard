@@ -57,12 +57,14 @@ Suggested repository name: `FarFileClipboard`.
 Push the repository and create a version tag, for example:
 
 ```text
-v1.0.1
+v1.0.2
 ```
 
 The release workflow accepts any `v*` tag and derives the package version from the tag name. The included GitHub Actions workflows build x86, x64 and ARM64 on Windows for every push/PR. Version tags create three binary ZIP assets plus the source ZIP.
 
-Before tagging a release, verify that the regular `build` workflow is green and that both ARM64 workflows are green:
+Before tagging a release, verify that the regular `build` workflow, the x86 functional test, and both ARM64 workflows are green:
+
+- `x86 functional test` — starts real 32-bit Far, verifies exact exports and F11 discovery, then performs Copy/Paste between two real panel directories through the plugin menu.
 
 - `ARM64 runtime test` — launches ARM64 Far with the ARM64 plugin on native Windows ARM64.
 - `ARM64 functional test` — verifies plugin discovery and performs Copy/Paste between two Far panel directories through the plugin menu.

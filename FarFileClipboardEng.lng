@@ -57,6 +57,10 @@
 "The Windows clipboard contains no file-system or Shell objects that can be pasted."
 // MOperationFailedPrefix
 "Windows could not complete the operation. Error code:"
+// MOperationAlreadyRunning
+"A FarFileClipboard background file operation is already running."
+// MBackgroundStartFailed
+"Could not start the background file operation."
 // MPastePanelOnly
 "Paste is supported only on a normal file-system panel."
 // MActivePanelNotFs
@@ -86,6 +90,8 @@
 
 // MConfigPrecheckInvalid
 "&Pre-check invalid operations"
+// MConfigSystemProgressUi
+"Use the Windows system progress window instead of Far"
 // MConfigConflictAsk
 "&Ask what to do"
 // MConfigConflictSystem
@@ -122,3 +128,24 @@
 "Enter a valid single file or directory name."
 // MConflictNameExists
 "An object with that name already exists. Choose another name."
+
+// MProgressCopy
+"Copying"
+// MProgressMove
+"Moving"
+// MProgressCurrentCopy
+"Copying:"
+// MProgressCurrentMove
+"Moving:"
+// MProgressTotal
+"Overall progress"
+// MProgressPreparing
+"Preparing..."
+// MProgressCancel
+"&Cancel"
+// MProgressCancelling
+"Cancelling operation..."
+// MProgressCancelQuestion1
+"The operation was interrupted."
+// MProgressCancelQuestion2
+"Do you really want to cancel?"

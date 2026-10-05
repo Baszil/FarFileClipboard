@@ -1,9 +1,9 @@
-#pragma code_page(65001)
+﻿#pragma code_page(65001)
 #include <windows.h>
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,0,0,0
- PRODUCTVERSION 1,0,0,0
+ FILEVERSION 1,0,2,0
+ PRODUCTVERSION 1,0,2,0
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS VS_FF_DEBUG
@@ -20,12 +20,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Qwaduda\0"
             VALUE "FileDescription", "FarFileClipboard - Windows file clipboard integration for Far Manager\0"
-            VALUE "FileVersion", "1.0.0\0"
+            VALUE "FileVersion", "1.0.2\0"
             VALUE "InternalName", "FarFileClipboard\0"
             VALUE "LegalCopyright", "Copyright (c) 2026 Qwaduda\0"
             VALUE "OriginalFilename", "FarFileClipboard.dll\0"
             VALUE "ProductName", "FarFileClipboard\0"
-            VALUE "ProductVersion", "1.0.0\0"
+            VALUE "ProductVersion", "1.0.2\0"
         END
     END
     BLOCK "VarFileInfo"

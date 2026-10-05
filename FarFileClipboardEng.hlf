@@ -35,12 +35,14 @@ Defaults are #C#, #X#, #V#, #D#, #Z# and #E#, i.e. Ctrl+Shift+C / X / V / D / Z 
 
 The #Defaults# button restores the original letters and default behavior settings. All six commands must use different letters.
 
-The same screen also configures invalid-operation prechecks and name-conflict handling.
+The same screen also configures the Windows system progress window, invalid-operation prechecks, and name-conflict handling.
 
 @Behavior
 $ #File-operation behavior#
 
 The #Pre-check invalid operations# checkbox enables FarFileClipboard checks for obviously invalid operations. When it is cleared, the request is passed straight to Windows; Windows restrictions still apply.
+
+#Use the Windows system progress window instead of Far# is off by default. Normal paste runs in the background and shows a window styled after Far's native copy progress: one current-file bar for a single file, and separate current-file and overall bars for multiple files or a directory. A #Cancel# button is visible; Esc/F10 also requests cancellation. The Explorer-style system progress UI can be enabled explicitly instead.
 
 Three name-conflict modes are available:
 
@@ -50,7 +52,7 @@ Three name-conflict modes are available:
 
 Template placeholders: #{name}# — basename without the final extension (full name for directories), #{ext}# — final extension including the dot (empty for directories), #{n}# — collision counter. #{n}# is mandatory. Default: #{name} ({n}){ext}#.
 
-The defaults are FarFileClipboard preliminary checks and the FarFileClipboard conflict dialog.
+By default the Far progress window, preliminary checks and the FarFileClipboard conflict dialog are enabled; the Windows system progress window is disabled.
 
 @Commands
 $ #Commands and clipboard behavior#

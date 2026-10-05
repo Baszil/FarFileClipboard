@@ -1,6 +1,8 @@
-cmake_minimum_required(VERSION 3.20)
+﻿cmake_minimum_required(VERSION 3.20)
 
-project(FarFileClipboard VERSION 1.0.0 LANGUAGES CXX RC)
+project(FarFileClipboard VERSION 1.0.2 LANGUAGES CXX RC)
+
+option(FFC_CANCEL_DIAGNOSTICS "Enable verbose cancellation/input diagnostics" OFF)
 
 if(NOT WIN32)
     message(FATAL_ERROR "FarFileClipboard is a Windows-only Far Manager plugin")
@@ -37,8 +39,32 @@ target_compile_definitions(FarFileClipboard PRIVATE
     FFC_ARCH_NAME=L"${FFC_ARCH}"
 )
 
+if(FFC_CANCEL_DIAGNOSTICS)
+    target_compile_definitions(FarFileClipboard PRIVATE FFC_CANCEL_DIAGNOSTICS=1)
+endif()
+
 if(MSVC)
+    # Ship a self-contained DLL.  In particular, the x86 plugin must not
+    # depend on a separately installed x86 Visual C++ runtime just to load in
+    # 32-bit Far Manager.
+    set_property(TARGET FarFileClipboard PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     target_compile_options(FarFileClipboard PRIVATE /W4 /permissive- /utf-8 /EHsc)
+
+    # On 32-bit MSVC, WINAPI (__stdcall) exports are decorated internally
+    # (_Name@4). Far looks up the public plugin API by its exact undecorated
+    # names. x64 and ARM64 do not have this decoration issue.
+    if(FFC_ARCH STREQUAL "x86")
+        target_link_options(FarFileClipboard PRIVATE
+            "/EXPORT:GetGlobalInfoW=_GetGlobalInfoW@4"
+            "/EXPORT:SetStartupInfoW=_SetStartupInfoW@4"
+            "/EXPORT:GetPluginInfoW=_GetPluginInfoW@4"
+            "/EXPORT:OpenW=_OpenW@4"
+            "/EXPORT:ConfigureW=_ConfigureW@4"
+            "/EXPORT:ProcessConsoleInputW=_ProcessConsoleInputW@4"
+            "/EXPORT:ProcessSynchroEventW=_ProcessSynchroEventW@4"
+        )
+    endif()
 endif()
 
 target_link_libraries(FarFileClipboard PRIVATE shell32 ole32 user32)

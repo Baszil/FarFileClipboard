@@ -17,6 +17,7 @@ using FARMESSAGEFLAGS = unsigned long long;
 constexpr FARMESSAGEFLAGS FMSG_WARNING  = 0x0000000000000001ULL;
 constexpr FARMESSAGEFLAGS FMSG_ALLINONE = 0x0000000000000010ULL;
 constexpr FARMESSAGEFLAGS FMSG_MB_OK     = 0x0000000000010000ULL;
+constexpr FARMESSAGEFLAGS FMSG_MB_YESNO  = 0x0000000000040000ULL;
 
 using INPUTBOXFLAGS = unsigned long long;
 constexpr INPUTBOXFLAGS FIB_NOUSELASTHISTORY = 0x0000000000000008ULL;
@@ -42,7 +43,11 @@ constexpr PANELINFOFLAGS PFLAGS_PLUGIN = 0x0000000000000800ULL;
 constexpr int PTYPE_FILEPANEL = 0;
 
 // ADVANCED_CONTROL_COMMANDS subset
+constexpr int ACTL_SYNCHRO       = 20;
 constexpr int ACTL_GETWINDOWTYPE = 28;
+
+// SYNCHRO_EVENTS subset
+constexpr intptr_t SE_COMMONSYNCHRO = 0;
 
 // WINDOWINFO_TYPE subset
 constexpr int WTYPE_UNKNOWN = -1;
@@ -126,6 +131,14 @@ struct ProcessConsoleInputInfo
     size_t StructSize;
     PROCESSCONSOLEINPUT_FLAGS Flags;
     INPUT_RECORD Rec;
+    void* Instance;
+};
+
+struct ProcessSynchroEventInfo
+{
+    size_t StructSize;
+    intptr_t Event;
+    void* Param;
     void* Instance;
 };
 
@@ -295,11 +308,16 @@ enum FARDIALOGITEMTYPES
 using FARDIALOGITEMFLAGS = unsigned long long;
 constexpr FARDIALOGITEMFLAGS DIF_NONE             = 0;
 constexpr FARDIALOGITEMFLAGS DIF_GROUP            = 0x0000000000000400ULL;
+constexpr FARDIALOGITEMFLAGS DIF_SHOWAMPERSAND    = 0x0000000000002000ULL;
+constexpr FARDIALOGITEMFLAGS DIF_CENTERGROUP      = 0x0000000000004000ULL;
 constexpr FARDIALOGITEMFLAGS DIF_NOBRACKETS       = 0x0000000000008000ULL;
 constexpr FARDIALOGITEMFLAGS DIF_SEPARATOR        = 0x0000000000010000ULL;
 constexpr FARDIALOGITEMFLAGS DIF_CENTERTEXT       = 0x0000000000040000ULL;
+constexpr FARDIALOGITEMFLAGS DIF_BTNNOCLOSE       = 0x0000000000040000ULL;
 constexpr FARDIALOGITEMFLAGS DIF_SELECTONENTRY    = 0x0000000000800000ULL;
 constexpr FARDIALOGITEMFLAGS DIF_NOAUTOCOMPLETE   = 0x0000000002000000ULL;
+constexpr FARDIALOGITEMFLAGS DIF_HIDDEN           = 0x0000000010000000ULL;
+constexpr FARDIALOGITEMFLAGS DIF_NOFOCUS          = 0x0000000040000000ULL;
 constexpr FARDIALOGITEMFLAGS DIF_DISABLE          = 0x0000000080000000ULL;
 constexpr FARDIALOGITEMFLAGS DIF_DEFAULTBUTTON    = 0x0000000100000000ULL;
 constexpr FARDIALOGITEMFLAGS DIF_FOCUS            = 0x0000000200000000ULL;
@@ -328,14 +346,26 @@ using FARDIALOGFLAGS = unsigned long long;
 constexpr FARDIALOGFLAGS FDLG_NONE = 0;
 constexpr FARDIALOGFLAGS FDLG_WARNING = 0x0000000000000001ULL;
 constexpr FARDIALOGFLAGS FDLG_SMALLDIALOG = 0x0000000000000002ULL;
+constexpr FARDIALOGFLAGS FDLG_KEEPCONSOLETITLE = 0x0000000000000010ULL;
+constexpr FARDIALOGFLAGS FDLG_NONMODAL = 0x0000000000000020ULL;
 
+constexpr intptr_t DM_CLOSE = 1;
 constexpr intptr_t DM_ENABLE = 2;
+constexpr intptr_t DM_GETDLGRECT = 6;
+constexpr intptr_t DM_SETFOCUS = 13;
+constexpr intptr_t DM_REDRAW = 14;
+constexpr intptr_t DM_GETFOCUS = 18;
 constexpr intptr_t DM_SETTEXTPTR = 22;
 constexpr intptr_t DM_GETCHECK = 25;
 constexpr intptr_t DM_SETCHECK = 26;
+constexpr intptr_t DM_GETITEMPOSITION = 48;
+constexpr intptr_t DM_SETINPUTNOTIFY = 49;
 constexpr intptr_t DM_GETCONSTTEXTPTR = 63;
 constexpr intptr_t DN_BTNCLICK = 4097;
 constexpr intptr_t DN_INITDIALOG = 4108;
+constexpr intptr_t DN_INPUT = 4115;
+constexpr intptr_t DN_CONTROLINPUT = 4116;
+constexpr intptr_t DN_CLOSE = 4117;
 
 using FARWINDOWPROC = intptr_t (WINAPI *)(
     HANDLE hDlg,
@@ -472,6 +502,7 @@ static_assert(sizeof(FarSettingsCreate) == 24, "Unexpected x86 FarSettingsCreate
 static_assert(sizeof(FarSettingsItem) == 32, "Unexpected x86 FarSettingsItem ABI layout");
 static_assert(sizeof(FarDialogItem) == 64, "Unexpected x86 FarDialogItem ABI layout");
 static_assert(sizeof(PluginStartupInfo) == 128, "Unexpected x86 PluginStartupInfo ABI prefix layout");
+static_assert(sizeof(ProcessSynchroEventInfo) == 16, "Unexpected x86 ProcessSynchroEventInfo ABI layout");
 #elif INTPTR_MAX == INT64_MAX
 static_assert(sizeof(GlobalInfo) == 96, "Unexpected 64-bit GlobalInfo ABI layout");
 static_assert(sizeof(PluginInfo) == 104, "Unexpected 64-bit PluginInfo ABI layout");
@@ -483,4 +514,5 @@ static_assert(sizeof(FarSettingsCreate) == 32, "Unexpected 64-bit FarSettingsCre
 static_assert(sizeof(FarSettingsItem) == 48, "Unexpected 64-bit FarSettingsItem ABI layout");
 static_assert(sizeof(FarDialogItem) == 112, "Unexpected 64-bit FarDialogItem ABI layout");
 static_assert(sizeof(PluginStartupInfo) == 256, "Unexpected 64-bit PluginStartupInfo ABI prefix layout");
+static_assert(sizeof(ProcessSynchroEventInfo) == 32, "Unexpected 64-bit ProcessSynchroEventInfo ABI layout");
 #endif

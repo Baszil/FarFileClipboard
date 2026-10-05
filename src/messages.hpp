@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 // Message IDs must stay in exactly the same order as the strings in every
 // FarFileClipboard*.lng file.
@@ -35,6 +35,8 @@ enum MessageId : intptr_t
     MClipboardWriteFailed,
     MClipboardEmpty,
     MOperationFailedPrefix,
+    MOperationAlreadyRunning,
+    MBackgroundStartFailed,
     MPastePanelOnly,
     MActivePanelNotFs,
     MCurrentItemFailed,
@@ -50,6 +52,7 @@ enum MessageId : intptr_t
     MRedoFailedPrefix,
 
     MConfigPrecheckInvalid,
+    MConfigSystemProgressUi,
     MConfigConflictAsk,
     MConfigConflictSystem,
     MConfigConflictAutoRename,
@@ -69,5 +72,16 @@ enum MessageId : intptr_t
     MConflictNewName,
     MConflictInvalidName,
     MConflictNameExists,
+
+    MProgressCopy,
+    MProgressMove,
+    MProgressCurrentCopy,
+    MProgressCurrentMove,
+    MProgressTotal,
+    MProgressPreparing,
+    MProgressCancel,
+    MProgressCancelling,
+    MProgressCancelQuestion1,
+    MProgressCancelQuestion2,
     MCount
 };

@@ -22,6 +22,20 @@ Run the full checklist on Far Manager 3 x64. Repeat the smoke-test subset on x86
 - `Ctrl+Shift+D` works only when the cursor is on a real directory.
 - `Ctrl+Shift+D` refuses files and `..`.
 
+## Background operation / progress UI
+
+- With **Show the Windows system progress window** disabled (default), start a copy large enough to take several seconds. No Explorer-style progress window must appear.
+- The Far progress box title must be the localized operation name (`Copying` / `Moving`), never `FarFileClipboard`; the bar must not use the old bracketed `[....]` presentation.
+- The current-file section and the overall section must have explicit localized labels from the `.lng` files. For one ordinary file there is one current-file bar; for multiple top-level items or a directory there is a current-file bar plus a separate overall bar.
+- Trigger cancellation separately with the **Cancel** button (mouse), Enter while that button is focused, Esc, and F10. Each single action must open the Far-style **Yes/No** confirmation immediately. Esc in the confirmation is equivalent to **No** and must resume the same transfer; **Yes** must stop the active transfer, not merely hide the progress window. No Enter/Esc/F10 input may reach the panel underneath or execute after the dialog closes.
+- Repeat the Cancel test with one large file that takes several seconds by itself. Cancellation must stop that current transfer, not only prevent the next queued file from starting.
+- Open configuration in Russian and verify that **Использовать системное окно прогресса Windows вместо Far** remains fully inside the double-box border, and that there is no empty row between the footer buttons and the bottom border.
+- While the default Far progress dialog is visible, panel commands must be blocked by the modal dialog; progress redraw and Cancel input must remain responsive.
+- Starting another FarFileClipboard paste while one is active must be rejected with the background-operation message rather than starting a second worker.
+- Undo/Redo must also be rejected while the background operation is active.
+- After completion, the panel refreshes and safe Undo history is available for an ordinary filesystem paste.
+- Enable **Show the Windows system progress window** and repeat. The Windows progress UI may appear, but Far itself must remain interactive because the operation is still executed off the Far main thread.
+
 ## Invalid-operation policy
 
 With **Pre-check invalid operations** enabled:
@@ -69,9 +83,9 @@ With **Pre-check invalid operations** disabled:
 
 - Russian Far loads `FarFileClipboardRus.lng` and Russian help.
 - English Far loads `FarFileClipboardEng.lng` and English help.
-- Configuration is one compact screen with no empty spacer rows: six hotkey rows, a plain separator, one operation-precheck checkbox, a plain separator, three conflict radio buttons, optional auto-rename template, a plain separator, then buttons.
+- Configuration is one compact screen with no empty spacer rows: six hotkey rows, a plain separator, operation-precheck and Windows-progress checkboxes, a plain separator, three conflict radio buttons, optional auto-rename template, a plain separator, then buttons.
 - Duplicate hotkey letters are rejected.
-- Defaults restore `C / X / V / D / Z / E`, preliminary checks enabled, the FarFileClipboard conflict dialog, and auto-rename template `{name} ({n}){ext}`.
+- Defaults restore `C / X / V / D / Z / E`, preliminary checks enabled, Windows progress UI disabled, the FarFileClipboard conflict dialog, and auto-rename template `{name} ({n}){ext}`.
 - Settings survive Far restart.
 
 
@@ -90,7 +104,8 @@ With **Pre-check invalid operations** disabled:
 3. In Far, press `Ctrl+Shift+V`. The objects must be extracted/copied into the current panel directory.
 4. Repeat with `Ctrl+Shift+D` while the cursor is on a real directory; the objects must appear inside that directory.
 5. Repeat with existing destination names in all three conflict modes: FarFileClipboard prompt, Windows system behavior, and automatic rename.
-6. Verify Undo/Redo is unavailable for this virtual-source paste and that no unrelated previous history survives it.
+6. Use a sufficiently large ZIP and verify Far remains interactive while the Shell extraction/copy is still running. With the Windows progress option disabled, no Explorer-style progress window should appear.
+7. Verify Undo/Redo is unavailable for this virtual-source paste and that no unrelated previous history survives it.
 
 ## UI polish checks
 - Name-conflict dialog uses Far's warning color scheme and the localized Warning title.
@@ -102,11 +117,13 @@ With **Pre-check invalid operations** disabled:
 
 Run this subset on each architecture with a matching Far Manager build:
 
-- x86 Far + x86 plugin: plugin loads, F11 menu opens, configuration opens, Copy/Paste works in both directions with Explorer.
+- x86 Far + x86 plugin: plugin loads, F11 menu opens, configuration opens, Copy/Paste works in both directions with Explorer. `.github/workflows/x86-functional.yml` automates exact export verification, F11 discovery and a real Copy/Paste through the plugin menu in 32-bit Far.
 - x64 Far + x64 plugin: same smoke test, then run the full checklist above.
 - ARM64 Far + ARM64 plugin: plugin loads natively, F11 menu opens, configuration opens, Copy/Paste works in both directions with Explorer. GitHub Actions additionally runs native ARM64 Far on `windows-11-arm` and performs an automated Far-to-Far Copy/Paste functional test through the plugin menu.
 - Verify that a DLL built for the wrong architecture is not used as a substitute for the matching build.
 - For every DLL, check PE machine type with `dumpbin /headers FarFileClipboard.dll` before packaging.
+- Extract the universal `FarFileClipboard-*-all.zip` and run `install.cmd` once against x86 Far and once against x64 Far (ARM64 too when available). The printed install plan must select `FarFileClipboard-x86`, `FarFileClipboard-x64` or `FarFileClipboard-ARM64` from the target `Far.exe`, never from the host OS / PowerShell architecture.
+- Deliberately leave only a mismatched single-architecture `FarFileClipboard` folder next to the installer and verify that installation stops with an architecture-mismatch error before copying anything.
 
 ## PE architecture verification
 
@@ -116,4 +133,4 @@ Every local `build.cmd <arch>` run and every GitHub Actions build validates the 
 - x64 = `IMAGE_FILE_MACHINE_AMD64` (`0x8664`)
 - ARM64 = `IMAGE_FILE_MACHINE_ARM64` (`0xAA64`)
 
-The PE check only proves the requested machine type. In addition, `.github/workflows/arm64-runtime.yml` launches ARM64 Far with the ARM64 plugin on a native Windows ARM64 runner, and `.github/workflows/arm64-functional.yml` verifies that Far discovers the plugin and completes a real Copy/Paste operation between two panel directories. Manual ARM64 testing is still useful for Explorer interoperability, dialogs, configuration and other UI behavior not covered by CI.
+The PE check only proves the requested machine type. In addition, `.github/workflows/x86-functional.yml` starts real 32-bit Far, checks that Far discovers the x86 plugin in F11, and completes a real Copy/Paste through the plugin menu. `.github/workflows/arm64-runtime.yml` launches ARM64 Far with the ARM64 plugin on a native Windows ARM64 runner, and `.github/workflows/arm64-functional.yml` verifies that Far discovers the plugin and completes a real Copy/Paste operation between two panel directories. MSVC release builds use the static runtime to avoid a separate architecture-specific VC runtime dependency at DLL load time. Manual testing is still useful for Explorer interoperability, dialogs, configuration and UI behavior not covered by CI.
