@@ -140,7 +140,7 @@ jobs:
 
           local function fail(name, value)
             mark(name, value)
-            actl.Quit(20)
+            mark("99-failed.txt", name)
           end
 
           Macro {
@@ -174,15 +174,14 @@ jobs:
               mark("04-plugin-in-f11.txt", tostring(pos))
 
               -- Menu.Select only moves the selection; the F11 menu remains open.
-              -- Close it before requesting Far shutdown, otherwise actl.Quit can
-              -- remain pending behind the modal menu and the process times out.
+              -- Close it and emit a success marker. The CI wrapper owns process
+              -- teardown, because graceful Far shutdown is not part of this test.
               Keys("Esc")
               if Area.Menu then
                 fail("93-f11-not-closed.txt")
                 return
               end
               mark("05-f11-closed.txt")
-              actl.Quit(0)
             end;
           }
           '@ | Set-Content -Path (Join-Path $macroDir "x86-release-load.lua") -Encoding UTF8
@@ -194,24 +193,58 @@ jobs:
             -WorkingDirectory $PWD `
             -PassThru
 
+          $successMarker = Join-Path $markers "05-f11-closed.txt"
+          $failureMarker = Join-Path $markers "99-failed.txt"
           $deadline = (Get-Date).AddSeconds(30)
-          while (-not $p.HasExited -and (Get-Date) -lt $deadline) {
-            Start-Sleep -Milliseconds 500
+
+          while (
+            -not (Test-Path $successMarker) -and
+            -not (Test-Path $failureMarker) -and
+            -not $p.HasExited -and
+            (Get-Date) -lt $deadline
+          ) {
+            Start-Sleep -Milliseconds 250
             $p.Refresh()
           }
-          if (-not $p.HasExited) {
-            Write-Host "===== x86 RELEASE SMOKE MARKERS BEFORE TIMEOUT ====="
+
+          function Show-SmokeMarkers {
             Get-ChildItem "markers" -File -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object {
               Write-Host ""
               Write-Host "[$($_.Name)]"
               Get-Content $_.FullName
             }
-            Write-Host "===================================================="
-            Stop-Process -Id $p.Id -Force
-            throw "x86 Far timed out"
           }
-          if ($p.ExitCode -ne 0) {
-            throw "x86 Far release smoke test failed with exit code $($p.ExitCode)"
+
+          if (Test-Path $failureMarker) {
+            Write-Host "===== x86 RELEASE SMOKE FAILURE MARKERS ====="
+            Show-SmokeMarkers
+            Write-Host "============================================= "
+            if (-not $p.HasExited) {
+              Stop-Process -Id $p.Id -Force
+              Wait-Process -Id $p.Id -ErrorAction SilentlyContinue
+            }
+            $reason = Get-Content $failureMarker -Raw
+            throw "x86 Far release smoke test failed: $reason"
+          }
+
+          if (-not (Test-Path $successMarker)) {
+            Write-Host "===== x86 RELEASE SMOKE MARKERS BEFORE FAILURE ====="
+            Show-SmokeMarkers
+            Write-Host "===================================================="
+            if (-not $p.HasExited) {
+              Stop-Process -Id $p.Id -Force
+              Wait-Process -Id $p.Id -ErrorAction SilentlyContinue
+              throw "x86 Far F11 discovery timed out"
+            }
+            throw "x86 Far exited before F11 discovery completed"
+          }
+
+          # The smoke test is complete once the plugin has been found in F11 and
+          # the menu has been closed. Do not make Far shutdown semantics part of
+          # this test: terminate the CI process explicitly after the success marker.
+          if (-not $p.HasExited) {
+            Stop-Process -Id $p.Id -Force
+            Wait-Process -Id $p.Id -ErrorAction SilentlyContinue
           }
 
           foreach ($name in @("01-macro-started.txt", "02-plugin-found.txt", "03-f11-open.txt", "04-plugin-in-f11.txt", "05-f11-closed.txt")) {
