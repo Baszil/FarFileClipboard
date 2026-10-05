@@ -172,6 +172,16 @@ jobs:
                 return
               end
               mark("04-plugin-in-f11.txt", tostring(pos))
+
+              -- Menu.Select only moves the selection; the F11 menu remains open.
+              -- Close it before requesting Far shutdown, otherwise actl.Quit can
+              -- remain pending behind the modal menu and the process times out.
+              Keys("Esc")
+              if Area.Menu then
+                fail("93-f11-not-closed.txt")
+                return
+              end
+              mark("05-f11-closed.txt")
               actl.Quit(0)
             end;
           }
@@ -190,6 +200,13 @@ jobs:
             $p.Refresh()
           }
           if (-not $p.HasExited) {
+            Write-Host "===== x86 RELEASE SMOKE MARKERS BEFORE TIMEOUT ====="
+            Get-ChildItem "markers" -File -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object {
+              Write-Host ""
+              Write-Host "[$($_.Name)]"
+              Get-Content $_.FullName
+            }
+            Write-Host "===================================================="
             Stop-Process -Id $p.Id -Force
             throw "x86 Far timed out"
           }
@@ -197,7 +214,7 @@ jobs:
             throw "x86 Far release smoke test failed with exit code $($p.ExitCode)"
           }
 
-          foreach ($name in @("01-macro-started.txt", "02-plugin-found.txt", "03-f11-open.txt", "04-plugin-in-f11.txt")) {
+          foreach ($name in @("01-macro-started.txt", "02-plugin-found.txt", "03-f11-open.txt", "04-plugin-in-f11.txt", "05-f11-closed.txt")) {
             if (!(Test-Path (Join-Path "markers" $name))) {
               Get-ChildItem "markers" -File -ErrorAction SilentlyContinue | ForEach-Object {
                 Write-Host "[$($_.Name)]"
